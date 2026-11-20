@@ -1,0 +1,146 @@
+// gomuks - A Matrix client written in Go.
+// Copyright (C) 2024 Tulir Asokan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+import React, { JSX, memo, use } from "react"
+import { getRoomAvatarThumbnailURL } from "@/api/media.ts"
+import { RoomListEntry, useRoomMember } from "@/api/statestore"
+import type { MemDBEvent, MemberEventContent } from "@/api/types"
+import useContentVisibility from "@/util/contentvisibility.ts"
+import { formatPreviewTime, newSafeDate } from "@/util/datetime.ts"
+import { getDisplayname } from "@/util/validation.ts"
+import ClientContext from "../ClientContext.ts"
+import MainScreenContext from "../MainScreenContext.ts"
+import { MenuPositioner, RoomMenu } from "../menu"
+import { ModalContext } from "../modal"
+import UnreadCount from "./UnreadCount.tsx"
+
+export interface RoomListEntryProps {
+	room: RoomListEntry
+	isActive: boolean
+	hidden: boolean
+	hideAvatar?: boolean
+}
+
+function getPreviewText(evt?: MemDBEvent, senderMemberEvt?: MemDBEvent | null): [string, JSX.Element | null] {
+	if (!evt) {
+		return ["", null]
+	}
+	const previewText = evt.local_content?.preview_text
+	if (previewText) {
+		// eslint-disable-next-line react-hooks/rules-of-hooks
+		const client = use(ClientContext)!
+		const displayname = evt.sender === client.userID
+			? "You"
+			: getDisplayname(evt.sender, senderMemberEvt?.content as MemberEventContent)
+		return [
+			`${displayname}: ${previewText}`,
+			<>
+				<span className="bidi-isolate">
+					{displayname.length > 16 ? displayname.slice(0, 12) + "…" : displayname}
+				</span>: {previewText}
+			</>,
+		]
+	}
+	return ["", null]
+}
+
+function renderEntry(room: RoomListEntry, hideAvatar: boolean | undefined, previewSender?: MemDBEvent | null) {
+	const [previewText, croppedPreviewText] = getPreviewText(room.preview_event, previewSender)
+
+	return <>
+		<img
+			loading="lazy"
+			className="avatar room-avatar"
+			src={getRoomAvatarThumbnailURL(room, undefined, hideAvatar)}
+			alt=""
+		/>
+		<div className="room-name">{room.name}</div>
+		{room.preview_event ? <div className="room-entry-timestamp">
+			{formatPreviewTime(newSafeDate(room.preview_event?.timestamp))}
+		</div> : null}
+		{previewText && <div className="message-preview" title={previewText}>{croppedPreviewText}</div>}
+		<UnreadCount counts={room} placeholder />
+	</>
+}
+
+const Entry = ({ room, isActive, hidden, hideAvatar }: RoomListEntryProps) => {
+	const [isVisible, divRef] = useContentVisibility<HTMLDivElement>()
+	const openModal = use(ModalContext)
+	const mainScreen = use(MainScreenContext)
+	const client = use(ClientContext)!
+	const realRoom = client.store.rooms.get(room.room_id)
+	const previewSender = useRoomMember(client, realRoom, room.preview_event?.sender)
+
+	const onContextMenu = (evt: React.MouseEvent<HTMLDivElement>) => {
+		if (evt.shiftKey) {
+			return
+		}
+		if (!realRoom) {
+			// TODO implement separate menu for invite rooms
+			console.error("Room state store not found for", room.room_id)
+			return
+		}
+		openModal({
+			content: <MenuPositioner
+				x={evt.clientX}
+				y={evt.clientY}
+				anchor="click"
+				Child={RoomMenu}
+				room={realRoom}
+				entry={room}
+			/>,
+			noHistory: true,
+		})
+		evt.preventDefault()
+	}
+	const classNames = ["room-entry"]
+	if (isActive) {
+		classNames.push("active")
+	}
+	if (hidden) {
+		classNames.push("hidden")
+	}
+	if (room.favorite_order !== undefined) {
+		classNames.push("favorite")
+	}
+	if (room.low_priority) {
+		classNames.push("low-priority")
+	}
+	if (room.dm_user_id) {
+		classNames.push("direct-chat")
+	}
+	if (room.is_invite) {
+		classNames.push("invite")
+	}
+	if (!room.preview_event) {
+		classNames.push("no-preview")
+	}
+	const hasUnreads = Boolean(room.marked_unread
+		|| room.unread_messages || room.unread_notifications || room.unread_highlights)
+	if (hasUnreads) {
+		classNames.push("has-unreads")
+	}
+	return <div
+		ref={divRef}
+		className={classNames.join(" ")}
+		onClick={mainScreen.clickRoom}
+		onContextMenu={onContextMenu}
+		data-room-id={room.room_id}
+	>
+		{isVisible ? renderEntry(room, hideAvatar, previewSender) : null}
+	</div>
+}
+
+export default memo(Entry)

@@ -1,0 +1,354 @@
+// gomuks - A Matrix client written in Go.
+// Copyright (C) 2024 Tulir Asokan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package gomuks
+
+import (
+	"cmp"
+	"context"
+	"embed"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"runtime"
+	"sync"
+	"syscall"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/dbutil"
+	"go.mau.fi/util/exerrors"
+	"go.mau.fi/util/exsync"
+	"go.mau.fi/util/exzerolog"
+	"go.mau.fi/util/ptr"
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/gomuks/pkg/hicli"
+	"go.mau.fi/gomuks/pkg/hicli/jsoncmd"
+	"go.mau.fi/gomuks/version"
+)
+
+type Gomuks struct {
+	Log    *zerolog.Logger
+	Server *http.Server
+	Client *hicli.HiClient
+
+	ConfigDir string
+	DataDir   string
+	CacheDir  string
+	TempDir   string
+	LogDir    string
+
+	FrontendFS    embed.FS
+	indexWithMeta []byte
+	indexETag     string
+	frontendETag  string
+
+	Config      Config
+	DisableAuth bool
+	DesktopKey  string
+
+	GetDBConfig    func() dbutil.PoolConfig
+	LogoutCallback func() error
+
+	initLock             sync.Mutex
+	notificationSyncLock sync.Mutex
+
+	stopOnce sync.Once
+	stopChan chan struct{}
+
+	EventBuffer *EventBuffer
+	execBuffer  *ExecutionBuffer[json.RawMessage, *mautrix.RespError]
+
+	// Maps from temporary MXC URIs from by the media repository for URL
+	// previews to permanent MXC URIs suitable for sending in an inline preview
+	temporaryMXCToPermanent         map[id.ContentURIString]id.ContentURIString
+	temporaryMXCToEncryptedFileInfo map[id.ContentURIString]*event.EncryptedFileInfo
+	temporaryMXCToBlurhash          map[id.ContentURIString]string
+}
+
+func NewGomuks() *Gomuks {
+	gmx := &Gomuks{
+		stopChan: make(chan struct{}),
+
+		temporaryMXCToPermanent:         map[id.ContentURIString]id.ContentURIString{},
+		temporaryMXCToEncryptedFileInfo: map[id.ContentURIString]*event.EncryptedFileInfo{},
+		temporaryMXCToBlurhash:          map[id.ContentURIString]string{},
+
+		execBuffer: NewExecutionBuffer[json.RawMessage, *mautrix.RespError](context.Background()),
+	}
+	gmx.GetDBConfig = func() dbutil.PoolConfig {
+		return dbutil.PoolConfig{
+			Type:         "sqlite3-fk-wal",
+			URI:          fmt.Sprintf("file:%s/gomuks.db?_txlock=immediate", gmx.DataDir),
+			MaxOpenConns: 5,
+			MaxIdleConns: 1,
+		}
+	}
+	return gmx
+}
+
+func (gmx *Gomuks) InitDirectories() {
+	// We need 4 directories: config, data, cache, logs
+	//
+	// 1. If GOMUKS_*_HOME is set, that value is used as the directory.
+	// 2. If GOMUKS_ROOT is set, all directories are created under that.
+	// 3. Use system-specific defaults as below
+	//
+	// *nix:
+	// - Config: $XDG_CONFIG_HOME/gomuks or $HOME/.config/gomuks
+	// - Data: $XDG_DATA_HOME/gomuks or $HOME/.local/share/gomuks
+	// - Cache: $XDG_CACHE_HOME/gomuks or $HOME/.cache/gomuks
+	// - Logs: $XDG_STATE_HOME/gomuks or $HOME/.local/state/gomuks
+	//
+	// Windows:
+	// - Config and Data: %AppData%\gomuks
+	// - Cache: %LocalAppData%\gomuks
+	// - Logs: %LocalAppData%\gomuks\logs
+	//
+	// macOS:
+	// - Config and Data: $HOME/Library/Application Support/gomuks
+	// - Cache: $HOME/Library/Caches/gomuks
+	// - Logs: $HOME/Library/Logs/gomuks
+	gomuksRoot := os.Getenv("GOMUKS_ROOT")
+	gmx.CacheDir = os.Getenv("GOMUKS_CACHE_HOME")
+	gmx.ConfigDir = os.Getenv("GOMUKS_CONFIG_HOME")
+	gmx.DataDir = os.Getenv("GOMUKS_DATA_HOME")
+	gmx.LogDir = os.Getenv("GOMUKS_LOGS_HOME")
+	if gomuksRoot != "" {
+		exerrors.PanicIfNotNil(os.MkdirAll(gomuksRoot, 0700))
+		gmx.CacheDir = cmp.Or(gmx.CacheDir, filepath.Join(gomuksRoot, "cache"))
+		gmx.ConfigDir = cmp.Or(gmx.ConfigDir, filepath.Join(gomuksRoot, "config"))
+		gmx.DataDir = cmp.Or(gmx.DataDir, filepath.Join(gomuksRoot, "data"))
+		gmx.LogDir = cmp.Or(gmx.LogDir, filepath.Join(gomuksRoot, "logs"))
+	} else {
+		homeDir := exerrors.Must(os.UserHomeDir())
+		if gmx.CacheDir == "" {
+			gmx.CacheDir = filepath.Join(exerrors.Must(os.UserCacheDir()), "gomuks")
+		}
+		if gmx.ConfigDir == "" {
+			gmx.ConfigDir = filepath.Join(exerrors.Must(os.UserConfigDir()), "gomuks")
+		}
+		if gmx.DataDir != "" {
+			// already set
+		} else if xdgDataHome := os.Getenv("XDG_DATA_HOME"); xdgDataHome != "" {
+			gmx.DataDir = filepath.Join(xdgDataHome, "gomuks")
+		} else if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			gmx.DataDir = gmx.ConfigDir
+		} else {
+			gmx.DataDir = filepath.Join(homeDir, ".local", "share", "gomuks")
+		}
+		if gmx.LogDir != "" {
+			// already set
+		} else if xdgStateHome := os.Getenv("XDG_STATE_HOME"); xdgStateHome != "" {
+			gmx.LogDir = filepath.Join(xdgStateHome, "gomuks")
+		} else if runtime.GOOS == "darwin" {
+			gmx.LogDir = filepath.Join(homeDir, "Library", "Logs", "gomuks")
+		} else if runtime.GOOS == "windows" {
+			gmx.LogDir = filepath.Join(gmx.CacheDir, "logs")
+		} else {
+			gmx.LogDir = filepath.Join(homeDir, ".local", "state", "gomuks")
+		}
+	}
+	if gmx.TempDir = os.Getenv("GOMUKS_TMPDIR"); gmx.TempDir == "" {
+		gmx.TempDir = filepath.Join(gmx.CacheDir, "tmp")
+	}
+	exerrors.PanicIfNotNil(os.MkdirAll(gmx.ConfigDir, 0700))
+	exerrors.PanicIfNotNil(os.MkdirAll(gmx.CacheDir, 0700))
+	exerrors.PanicIfNotNil(os.MkdirAll(gmx.TempDir, 0700))
+	exerrors.PanicIfNotNil(os.MkdirAll(gmx.DataDir, 0700))
+	exerrors.PanicIfNotNil(os.MkdirAll(gmx.LogDir, 0700))
+	defaultFileWriter.FileConfig.Filename = filepath.Join(gmx.LogDir, "gomuks.log")
+}
+
+func (gmx *Gomuks) SetupLog() {
+	gmx.Log = exerrors.Must(gmx.Config.Logging.Compile())
+	exzerolog.SetupDefaults(gmx.Log)
+}
+
+func (gmx *Gomuks) StartClient() {
+	exitCode := gmx.StartClientWithoutExit(gmx.Log.WithContext(context.Background()))
+	if exitCode != 0 {
+		os.Exit(exitCode)
+	}
+}
+
+func (gmx *Gomuks) initClient() error {
+	gmx.initLock.Lock()
+	defer gmx.initLock.Unlock()
+	if gmx.Client != nil {
+		return nil
+	}
+	hicli.HTMLSanitizerImgSrcTemplate = "_gomuks/media/%s/%s?encrypted=false"
+	rawDB, err := dbutil.NewFromConfig("gomuks", dbutil.Config{
+		PoolConfig: gmx.GetDBConfig(),
+	}, dbutil.ZeroLogger(gmx.Log.With().Str("component", "hicli").Str("db_section", "main").Logger()))
+	if err != nil {
+		gmx.Log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Failed to open database")
+		return err
+	}
+	gmx.Client = hicli.New(
+		rawDB,
+		nil,
+		gmx.Log.With().Str("component", "hicli").Logger(),
+		[]byte("meow"),
+		gmx.HandleEvent,
+	)
+	gmx.Client.Client.SyncPresence = ptr.Val(gmx.Config.Matrix.SetPresence)
+	if gmx.Config.Matrix.InitialDeviceDisplayName != "" {
+		gmx.Client.InitialDeviceDisplayName = gmx.Config.Matrix.InitialDeviceDisplayName
+	}
+	if gmx.Config.Matrix.ResettableNetwork {
+		gmx.Client.Client.RequestRetryTrigger = exsync.NewEvent()
+	}
+	gmx.Client.LogoutFunc = gmx.Logout
+	httpClient := gmx.Client.Client.Client
+	if runtime.GOOS == "js" {
+		gmx.Client.Client.UserAgent = ""
+		httpClient.Transport = nil
+	} else {
+		transport := httpClient.Transport.(*http.Transport)
+		if !gmx.Config.Matrix.DisableHTTP2 {
+			transport.ForceAttemptHTTP2 = true
+			transport.HTTP2 = &http.HTTP2Config{SendPingTimeout: 15 * time.Second}
+		} else {
+			transport.ForceAttemptHTTP2 = false
+			transport.HTTP2 = nil
+		}
+		gmx.Client.RequestTimeout = gmx.Config.Matrix.RequestTimeout
+		if gmx.Config.Matrix.InitSyncTimeout > 0 {
+			transport.ResponseHeaderTimeout = gmx.Config.Matrix.InitSyncTimeout
+			httpClient.Timeout = gmx.Config.Matrix.InitSyncTimeout
+		}
+	}
+	gmx.Log.Debug().Msg("Client instance created")
+	return nil
+}
+
+func (gmx *Gomuks) initClientForNotifications(ctx context.Context) error {
+	if err := gmx.initClient(); err != nil {
+		return err
+	}
+	if gmx.Client.Account != nil {
+		return nil
+	}
+	userID, err := gmx.Client.DB.Account.GetFirstUserID(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get first user ID: %w", err)
+	} else if userID == "" {
+		return fmt.Errorf("no user ID stored")
+	}
+	return gmx.Client.Load(ctx, userID)
+}
+
+func (gmx *Gomuks) StartClientWithoutExit(ctx context.Context) int {
+	if err := gmx.initClient(); err != nil {
+		return 10
+	}
+	userID, err := gmx.Client.DB.Account.GetFirstUserID(ctx)
+	if err != nil {
+		gmx.Log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Failed to get first user ID")
+		return 11
+	}
+	err = gmx.Client.Load(ctx, userID)
+	if err == nil {
+		err = gmx.Client.Start(ctx)
+	}
+	if errors.Is(err, mautrix.MUnknownToken) || errors.Is(err, mautrix.ErrOAuthInvalidGrant) {
+		gmx.Log.Err(err).Msg("Failed to start client, logging out")
+		err = gmx.Logout(ctx)
+		if err != nil {
+			gmx.Log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Failed to logout after unknown token error")
+			return 12
+		}
+		return 0
+	} else if err != nil {
+		gmx.Log.WithLevel(zerolog.FatalLevel).Err(err).Msg("Failed to start client")
+		return 12
+	}
+	gmx.Log.Info().Stringer("user_id", userID).Msg("Client started")
+	return 0
+}
+
+func (gmx *Gomuks) HandleEvent(evt any) {
+	gmx.EventBuffer.Push(evt)
+	syncComplete, ok := evt.(*jsoncmd.SyncComplete)
+	if ok && ptr.Val(syncComplete.Since) != "" && !DisablePush {
+		go gmx.SendPushNotifications(syncComplete)
+	}
+}
+
+func (gmx *Gomuks) Stop() {
+	gmx.stopOnce.Do(func() {
+		close(gmx.stopChan)
+	})
+}
+
+func (gmx *Gomuks) WaitForInterrupt() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-c:
+	case <-gmx.stopChan:
+	}
+}
+
+func (gmx *Gomuks) DirectStop() {
+	if gmx.EventBuffer != nil {
+		for _, closer := range gmx.EventBuffer.GetClosers() {
+			closer(websocket.StatusServiceRestart, "Server shutting down")
+		}
+	}
+	if gmx.Client != nil {
+		gmx.Client.Stop()
+	}
+	if gmx.Server != nil {
+		err := gmx.Server.Close()
+		if err != nil {
+			gmx.Log.Error().Err(err).Msg("Failed to close server")
+		}
+	}
+}
+
+func (gmx *Gomuks) Run() {
+	gmx.InitDirectories()
+	err := gmx.LoadConfig()
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "Failed to load config:", err)
+		os.Exit(9)
+	}
+	gmx.SetupLog()
+	gmx.Log.Info().
+		Str("version", version.Gomuks.FormattedVersion).
+		Str("go_version", runtime.Version()).
+		Time("built_at", version.Gomuks.BuildTime).
+		Msg("Initializing gomuks")
+	gmx.StartServer()
+	gmx.StartClient()
+	gmx.Log.Info().Msg("Initialization complete")
+	gmx.WaitForInterrupt()
+	gmx.Log.Info().Msg("Shutting down...")
+	gmx.DirectStop()
+	gmx.Log.Info().Msg("Shutdown complete")
+	os.Exit(0)
+}

@@ -1,0 +1,625 @@
+# v26.11.1
+
+### Backend
+* Fixed removing own reactions failing.
+* Updated mautrix-go to build with goolm by default, even if the build tag
+  isn't specified.
+
+### Desktop
+* Updated to Electron 45
+
+# v26.11
+
+### Backend
+* Added RFC 10036 `Incremental` header for SSE connections so compatible reverse
+  proxies like Caddy disable buffering.
+* Added per-message profile info to push data.
+* Added support for FCM push gateways specified by the frontend.
+  * Currently, the push gateways need to be whitelisted in the config.
+* Added support for OAuth step-up auth with existing OAuth login methods.
+* Added methods for viewing and updating room directory.
+* Added config option to not delete media cache on logout.
+  * This is recommended if you share the media cache between multiple instances.
+* Added method to get the MSC4391 definitions of internal gomuks commands
+  (thanks to [@Henry-Hiles] in [#773]).
+* Added method for upgrading rooms (thanks to [@Henry-Hiles] in [#774]).
+* Added caching theme proxy.
+  * To use it, simply replace `https://css.gomuks.app` with `_gomuks` in your
+    CSS imports.
+  * The cache will keep previously loaded themes working even if it can't reach
+    css.gomuks.app.
+  * If you link to a specific commit, the backend will cache it permanently and
+    will never refetch. Non-specific commits are refetched at most once an hour.
+* Changed `get_mentions` to never return a null array.
+* Changed default build scripts to build with goolm.
+* Changed event processing to preserve unknown top-level fields. They'll be
+  placed under a custom `unknown_top_level` field.
+* Fixed event decryption lock not being acquired for sync properly, which lead
+  to some database queries timing out and failing due to deadlocks.
+
+### Web
+* Bumped minimum browser versions to Firefox 153, Chrome 155 and Safari 27.
+* Added support for stable policy list rooms.
+
+### C FFI
+* Added push message info to push notification handling instead of only
+  returning raw event and room info.
+  * Clients should prefer using only the pre-processed push data.
+* Added method to reset network connections.
+  * Clients should listen to OS-level network change events and call this to
+    reconnect faster.
+* Added method to pause sync without stopping the client entirely.
+* Added `GomuksAllocBuffer` for platforms where malloc isn't easily available
+  (thanks to [@Henry-Hiles] in [#771]).
+
+[@Henry-Hiles]: https://github.com/Henry-Hiles
+[#771]: https://github.com/gomuks/gomuks/pull/771
+[#773]: https://github.com/gomuks/gomuks/pull/773
+[#774]: https://github.com/gomuks/gomuks/pull/774
+
+# v26.10
+
+### Backend
+* Added fallback text if the preview message has no text itself.
+* Added h2c support for HTTP server.
+* Added option to listen with TLS.
+* Added option to change initial device displayname via the config file.
+* Added support for storing edits received from server-side aggregations.
+* Added support for displaying reactions with quotes in the text.
+* Added aggregation of own reaction event IDs.
+* Added room alias management RPC methods.
+* Added config options to change HTTP request timeouts.
+* Added `is_dm` flag to pushes.
+* Added `formatted_body` for fake events (like command responses) so frontends
+  that don't use the sanitized HTML can still render them.
+* Added RPC methods for calling MatrixRTC livekit token endpoints.
+* Added support for sending thread read receipts via RPC API.
+* Added support for logging out in the Wasm build.
+* Changed response type of `get_mentions` to support returning related events.
+* Changed HTML sanitizer to allow `<small>` tag.
+* Optimized filling reaction count and latest edit aggregations.
+* Improved various database indexes to be more efficient.
+* Fixed reaction counts not being recalculated when paginating history.
+* Fixed timeline reset failing when logged into an account that's only joined
+  to 1 room.
+* Fixed syncs not returning latest aggregation data when the original event and
+  aggregated events like edits and reactions were a part of the same sync.
+
+### Web
+* Added spacious room list style option, in addition to the existing compact
+  and standard styles.
+* Added support for removing own reactions by clicking on them.
+* Added `/upgraderoom` command, which pre-fills the room creation dialog.
+* Added locally failed sends (ones that didn't even reach the backend) to the
+  timeline to allow retrying them.
+* Added support for sharing plain text on Android.
+* Added support for sharing to a specific room on Android.
+* Added reporting sent messages to Android wrapper for updating native
+  conversation shortcuts.
+* Added option to override default preferences from backend config.
+* Added support for rendering galleries.
+  * Sending is also supported, but mostly disabled, as allowing sending such
+    backwards-incompatible events would be irresponsible.
+* Added support for dropping files in the chat view to upload them.
+* Improved picking the letter for fallback avatars.
+* Fixed pending device code login state not being cleared on successful login.
+* Fixed composer draft not being cleared when jumping to another room with
+  `/join`.
+* Fixed context menu opening on mobile when unspoilering text or clicking polls.
+* Fixed profiles not showing up in notifications panel.
+* Fixed copy /raw button for unencrypted events in encrypted rooms.
+* Fixed shares from Android being dropped if the main screen wasn't loaded.
+* Fixed extra whitespace when copying text from the event source view.
+
+### C FFI
+* Removed root parameter from `GomuksInit`.
+* Added `GomuksSetEnv` function for setting environment variables like `GOMUKS_ROOT`.
+* Added config parameter to `GomuksInit`.
+* Changed `GomuksHandlePush` to return room data in addition to the event.
+
+### Go RPC client
+* Fixed handling syncs without room metadata
+  (thanks to [@bleader] in [#763]).
+
+[@bleader]: https://github.com/bleader
+[#763]: https://github.com/gomuks/gomuks/pull/763
+
+# v26.09
+
+### Backend
+* Bumped minimum Go version to 1.26.
+* Added support for handling push notifications from homeserver.
+  * This is meant for clients that use gomuks as an SDK.
+    The web frontend won't use it.
+* Added support for accounts with a broken default SSSS key ID (likely caused
+  by setting up encryption with fluffychat).
+* Added `--update` flag to update the current backend binary and exit.
+* Added preview text to locally calculated content of events and stopped
+  mutating the raw content to remove fallbacks.
+* Added callback-based async methods to the C FFI.
+* Switched macOS CI builds to use goolm.
+* Fixed room sorting timestamp being bumped by all encrypted events instead of
+  only messages.
+
+### Web
+* Added swipe to reply.
+* Added support for jumping to raw event IDs using `/join`.
+* Added button to copy `/raw` command including per-message profile in event
+  source view.
+* Added `/version` command to check the current gomuks version.
+* Added app identifier to outgoing messages.
+* Added compact room list option.
+* Adjusted padding of composer and room list entries, and fixed alignment of
+  unread counters.
+* Changed room names in room list to be less bold when the room is fully read.
+* Changed default font to Inter instead of OS defaults.
+* Changed emoji/sticker/gif picker to not take up the entire screen on mobile.
+* Changed message send errors to be rendered more prominently.
+* Re-added support for Tenor in the gif picker.
+* Removed custom top context menu on mobile and changed the standard context
+  menu to open when tapping a message.
+* Disabled the ability to reply to internal command response messages.
+* Fixed message search results not showing date of newest result.
+* Fixed internal command response messages using a federated mxc for the avatar
+  instead of loading it locally.
+* Fixed tall images being stretched in the upload dialog.
+
+# v26.08
+
+### Backend
+* Added streaming HTTP response as an alternative for websockets.
+  * The stream can either use server-sent events (`text/event-stream`)
+    or plain JSON objects (`application/jsonl`) based on the `Accept` header.
+* Added support for room list catch-up syncs for frontends.
+* Added media download method to C FFI.
+* Added support for using the reply UI with the `/raw` command.
+* Added `/htmlmd` command which allows sending messages that mix HTML and
+  markdown.
+* Added support for calling any HTTP endpoint with basic auth without having
+  to exchange it for an auth cookie first.
+* Added `get_versions` and `get_capabilities` commands to get features supported
+  by the homeserver.
+* Switched to latest revision of [MSC4461] for sending per-message profiles.
+* Changed recovery key reset RPC API generate cross-signing with the recovery
+  key and taking them as a parameter to the upload request instead of generating
+  at upload time.
+* Changed format of `get_profile` responses to allow locally generated fields.
+* Changed sync responses to allow omitting any field in room entries.
+* Changed HTML sanitizer to only allow checkboxes inside unordered list items.
+* Changed room state resync to send space edges to clients if the room being
+  resynced is a space.
+* Changed verification check to fall back to the verify screen if the key backup
+  encryption key has changed.
+* Fixed HTML sanitizer not applying the depth limit specified by Matrix.
+* Fixed `prev_batch` token not being saved when paginating messages from the
+  server returns no new messages.
+* Fixed `prev_batch` not being reset on limited syncs.
+* Fixed clients never receiving initial sync payload if they connect during
+  database initialization.
+
+### Web
+* Added option to use server-sent events instead of websockets.
+* Added optional client-side room list cache, which is used to reduce the
+  initial payload size when reloading the page. The cache is enabled when both
+  SSE and low-bandwidth mode are enabled.
+* Added knocked users to room user list.
+* Added option to pin low priority rooms to bottom of room list.
+* Added option to stop counting unread messages in low priority rooms.
+* Added button to reset TOFU status after another user's master key changed.
+* Added hacky support for checking/unchecking todo list items in own messages.
+* Added button to subscribe to image packs in the image pack editor.
+* Added button to open the user's member event from the right panel user info.
+* Added button for fetching previous state events in the room state explorer.
+* Added current backend version string to settings.
+* Added support for [MSC4440] profile biographies.
+* Changed user info panel to blur any user-defined fields if the user is banned
+  in the current room.
+* Changed per-message profile rendering to not render "via" if the name is the
+  same.
+* Fixed websocket auto-reconnection getting throttled by browsers.
+* Fixed typing notifications getting stuck when the websocket reconnects.
+* Fixed unread counts and space bar not being visible when the room list was
+  resized to be too small.
+
+[MSC4440]: https://github.com/matrix-org/matrix-spec-proposals/pull/4440
+
+### Desktop
+* Added UI for managing backends.
+* Added option to disable tray icon.
+  * Closing the main window will stop the backend too when the tray is disabled.
+* Added option to disable notifications per backend.
+
+# v26.07
+
+### Backend
+* Updated Docker image to Alpine 3.24.
+* Added support for OAuth login.
+* Added command to create polls.
+* Fixed own profile being refetched too often.
+* Fixed initial sync of very big spaces.
+* Fixed direct chat status getting out of sync with `m.direct` in some rare cases.
+* Removed support for legacy SSO (legacy password auth is still supported).
+
+### Web
+* Added support for OAuth login.
+  * Device code login is the default. On servers that don't support it,
+    authorization code redirect login is supported in some limited cases.
+* Added rendering for polls.
+* Added power level changer in user info panel.
+* Added default aspect ratio for custom emojis to avoid timeline jumping when
+  lots of them are loaded.
+* Added own device list to settings.
+* Added room metadata changing to settings.
+* Added button to open settings without being in a room.
+* Split settings view into tabs so things are easier to find.
+* Changed behavior of escape key: it will now clear any reply state in the
+  composer (like it already did for edits) and/or close the right panel before
+  closing the room view.
+* Fixed sidebars not being properly resizable on small screens.
+* Fixed pasting commands (like `/raw`) on mobile.
+
+# v26.06
+
+### Backend
+* Added local full-text search support.
+  * Upgrading may take a few minutes if your database is large.
+  * The backend must now be compiled with the `sqlite_fts5` build tag. The build
+    scripts will add it by default, but if you run `go build` manually, you need
+    to add the tag yourself.
+* Added support for thumbnailing animated webp avatars.
+* Added support for correctly rotating HEIC images when re-encoding uploads.
+* Added documentation generator for RPC API and an OpenAPI spec for the HTTP API.
+* Added `/powerlevel` command to change individual power levels.
+* Changed environment variable processing to prefer `GOMUKS_*_HOME` over
+  `GOMUKS_ROOT` to allow finer control.
+* Fixed panic when cancelling media uploads.
+
+### Web
+* Rewrote desktop wrapper to use Electron instead of Wails.
+  * Linux builds now have an actually usable browser engine,
+    and macOS builds are signed to allow installing without workarounds.
+  * The new wrapper supports both embedded and remote backends and can have
+    multiple backends at once. Extra backends have to be added manually for now,
+    management UI will be added later.
+* Added message search panel.
+* Added separate message context menu button to open thread panel.
+* Added undo button to move a failed message send back into the composer.
+* Added push rule editor to devtools.
+* Fixed reaction images not having a maximum width.
+* Fixed successfully decrypted events with an empty `type` showing up as waiting
+  for decryption.
+* Fixed pinned messages view not showing edits of old messages.
+* Fixed emoji/sticker picker categories not adjusting to picker width properly.
+* Fixed bottom safe area inset not being applied properly when using Android
+  wrapper.
+
+# v26.05
+
+### Backend
+* Added support for `Range` requests when downloading media.
+* Added support for sending per-message profiles with [MSC4461].
+* Changed resyncing state to detect the user being state reset out of the room
+  even if the request doesn't fail (e.g. due to the room being world-readable).
+* Fixed login failing if the user has no SSSS set up.
+
+### Web
+* Added support for reading stable [MSC2545] event types.
+* Added support for per-room notification sounds.
+* Added option to force sending an attachment as a file.
+* Added the `value` to the whitelisted attributes for `li` tags
+  (allows ordered lists where the indexes jump arbitrarily).
+* Changed `/join` command to accept user IDs and event links in addition to
+  plain room links/aliases.
+* Fixed SSO login not working if the homeserver URL had a trailing slash.
+* Fixed unicode RTL overrides not being isolated properly in some contexts.
+
+[MSC2545]: https://github.com/matrix-org/matrix-spec-proposals/pull/2545
+[MSC4461]: https://github.com/matrix-org/matrix-spec-proposals/pull/4461
+
+# v26.04
+
+### Backend
+* Added automatic logout when receiving `M_UNKNOWN_TOKEN` error from server.
+* Added support for receiving sticky events and forwarding them to the frontend.
+  The frontend can also query all active sticky events in a given room.
+* Added support for resetting cross-signing and key backup.
+* Changed the auth endpoint to explicitly refuse insecure requests from web
+  clients to make the error message clearer.
+* Fixed empty spaces not being sent to frontend.
+* Fixed panic if `/timestamp` command is missing parameters.
+* Fixed websocket request handling panics not being caught properly.
+
+### Web
+* Added option to reset encryption when logging in.
+* Added profile field editor to devtools.
+* Added full reaction list modal in event menu.
+* Added simple pronoun input to own profile view. Note that the input disables
+  itself if you have non-standard or non-english pronouns in your profile. You
+  can delete or modify such values using the profile editor in devtools.
+* Added options for sorting room list (alphabetical and favorites first).
+* Added option to change max image width in timeline.
+* Added escape keybinding to close active room
+  (thanks to [@kittyandrew] in [#698]).
+* Added preference to autoplay video gifs (thanks to [@kittyandrew] in [#705]).
+* Added support for sending sticky events to widgets.
+* Added shortcut to open space home by clicking on space icon again.
+* Removed support for account image packs as they were removed from MSC2545.
+* Changed tab size in code blocks to 4 spaces instead of the default 8.
+* Fixed `knock_restricted` rooms not showing join button correctly.
+* Fixed handling code blocks that use `<br>` instead of `\n`.
+* Fixed incorrect video size when thumbnail resolution is different than video
+  (thanks to [@kittyandrew] in [#699]).
+* Fixed displayname of room preview message sender not being fetched
+  automatically.
+* Fixed copying `/rawstate` commands with empty state key from view source
+  (thanks to [@nexy7574] in [#689]).
+* Fixed timeline not staying scrolled up when jumping to an old event from
+  another room.
+* Fixed downloading media in widget API.
+
+# v26.03
+
+### Backend
+* Added option to build with dynamic libheif.
+* Added automatic logout on unknown token errors.
+* Switched to `m.direct` event for classifying direct chats.
+* Fixed weirdness after login by sending the normal init payloads instead of
+  the Matrix init sync payload to frontends.
+* Fixed option to disable auth not working correctly.
+* Fixed voice message metadata incorrectly being added to all attachments.
+
+### Web
+* Added support for klipy in gif picker.
+* Added button to re-request megolm sessions from key backup and other devices.
+* Added fallback name for invites with no name information included.
+* Removed rainbow background on dark theme (can be restored using the
+  [make dark gay again theme](https://css.gomuks.app/theme/restore-dark-rainbow)).
+
+# v26.02
+
+### Backend
+* Bumped minimum Go version to 1.25.
+* Added C FFI package for embedding the backend into any kind of client.
+* Added triggered push rule ID to local content of events for debugging.
+* Added support for handling recovery keys with no verification metadata or
+  broken verification metadata generated by nheko.
+* Added config option to set sync presence to always online instead of the
+  default always offline.
+* Changed DM detection to allow the rooms to have an explicit room name set.
+
+### Web
+* Added support for always on screen widgets that follow you between rooms.
+* Added loading indicator to action modals like reporting messages.
+* Added support for hiding events in JS to have accurate date separators even
+  if all events are hidden.
+* Added support for showing read receipts of hidden events on previous visible
+  event.
+* Added option to hide profile changes while showing other member events.
+* Added blurhashes for URL preview images.
+* Added button for creating new image packs.
+* Added support for being a share target when using the Android wrapper app.
+* Added button to show composer in tombstoned rooms.
+* Updated delayed event widget API to fix Element Call.
+* Changed timeline rendering to ignore nested encrypted events.
+* Fixed font size of header tags.
+* Fixed alignment of reaction emoji picker on small screens.
+* Fixed giphy gifs not showing up in composer correctly.
+
+### Terminal
+* Fixed replying to messages.
+
+# v26.01
+
+### Backend
+* Added some documentation for the RPC API.
+* Added local calculation of heroes when fetching full member list as a
+  workaround for servers that don't provide accurate lazy loading summaries.
+* Fixed DM flag being cleared if the recipient leaves.
+
+### Web
+* Added notification center in right panel.
+* Added option to reply to messags using ctrl+arrow up/down.
+* Added blurred URL preview images and click-to-view support in rooms with media
+  previews disabled.
+* Added metadata in room preview for non-invite rooms.
+* Switched command system from MSC4332 to MSC4391.
+* Switched default GIF provider to Giphy as Tenor is being shut down in June.
+* Removed power level check for sticker picker to allow subscribing to packs
+  even if the image pack room doesn't allow sending messages.
+* Fixed room list previews having incorrect sender information if it was updated
+  by a message being decrypted late.
+* Fixed timeline crash if a message timestamp was outside what JS's `Date` allows.
+
+### Terminal
+* Added basic support for MSC4391 commands.
+* Improved error message when trying to log in with an invalid backend address.
+
+# v25.12
+
+### Backend
+* Updated Docker image to Alpine 3.23.
+* Added commands to remove and add aliases (thanks to [@nexy7574] in [#672]).
+* Fixed `/myroomnick`/`avatar` commands failing after joining a room with
+  restricted join rules.
+* Fixed race condition where a recovery key input screen would show up if the
+  backend hadn't finished initializing when the frontend was loaded.
+* Fixed `/roomname` command not accepting an argument.
+
+[@nexy7574]: https://github.com/nexy7574
+[#672]: https://github.com/gomuks/gomuks/pull/672
+
+### Web
+* Added voice message recorder.
+* Added image pack editor.
+* Added support for downloading media on the Android wrapper.
+
+# v25.11
+
+The first release of new gomuks is here! gomuks now consists of a backend plus
+different frontends, like web and terminal. For context, see
+<https://github.com/gomuks/gomuks/issues/476>.
+
+The terminal frontend is currently a separate binary, but will be combined with
+the backend in a future release. It's also not at feature parity with legacy
+gomuks yet, but it works.
+
+See the installation instructions for more details:
+<https://docs.mau.fi/gomuks/installation.html>
+
+# v0.3.1 (2024-07-16)
+
+* Bumped minimum Go version to 1.21.
+* Added support for authenticated media.
+* Added `/powerlevel` command for managing power levels.
+* Disabled logging by default.
+* Changed default log directory to `~/.local/state/gomuks` on Linux.
+
+# v0.3.0 (2022-11-19)
+
+* Bumped minimum Go version to 1.18.
+* Switched from `/r0` to `/v3` paths everywhere.
+  * The new `v3` paths are implemented since Synapse 1.48, Dendrite 0.6.5,
+    and Conduit 0.4.0. Servers older than these are no longer supported.
+* Added config flags for backspace behavior.
+* Added `/rainbownotice` command to send a rainbow as a `m.notice` message.
+* Added support for editing messages in an external editor.
+* Added arrow key support for navigating results in fuzzy search.
+* Added initial support for configurable keyboard shortcuts
+  (thanks to [@3nprob] in [#328]).
+* Added support for shortcodes *without* tab-completion in `/react`
+  (thanks to [@tleb] in [#354]).
+* Added background color to differentiate `inline code`
+  (thanks to [@n-peugnet] in [#361]).
+* Added tab-completion support for `/toggle` options
+  (thanks to [@n-peugnet] in [#362]).
+* Added initial support for rendering spoilers in messages.
+* Added support for sending spoilers (with `||reason|spoiler||` or `||spoiler||`).
+* Added support for inline links (limited terminal support; requires
+  `/toggle inlineurls`).
+* Added graphical file picker for `/upload` when no path is provided
+  (requires `zenity`).
+* Updated more places to use default/reverse colors instead of white/black to
+  better work on light themed terminals (thanks to [@n-peugnet] in [#401]).
+* Fixed mentions being lost when editing messages.
+* Fixed date change messages showing the wrong date.
+* Fixed some whitespace in HTML being rendered even when it shouldn't.
+* Fixed copying non-text messages with `/copy`.
+* Fixed rendering code blocks with unknown languages
+  (thanks to [@n-peugnet] in [#386]).
+* Fixed newlines not working in code blocks with certain syntax highlightings
+  (thanks to [@n-peugnet] in [#387]).
+* Fixed rendering more than one reaction of the same type in a single message
+  (thanks to [@n-peugnet] in [#391]).
+* Fixed line-wrapped messages getting corrupted when receiving a reaction
+  (thanks to [@n-peugnet] in [#397]).
+
+[@3nprob]: https://github.com/3nprob
+[@tleb]: https://github.com/tleb
+[@n-peugnet]: https://github.com/n-peugnet
+[#328]: https://github.com/gomuks/gomuks/pull/328
+[#354]: https://github.com/gomuks/gomuks/pull/354
+[#361]: https://github.com/gomuks/gomuks/pull/361
+[#362]: https://github.com/gomuks/gomuks/pull/362
+[#401]: https://github.com/gomuks/gomuks/pull/401
+
+# v0.2.4 (2021-09-21)
+
+* Added `is_direct` flag when creating DMs (thanks to [@gsauthof] in [#261]).
+* Added `newline` toggle for swapping enter and alt-enter behavior
+  (thanks to [@octeep] in [#270]).
+* Added `timestamps` toggle for disabling timestamps in the UI
+  (thanks to [@lxea] in [#304]).
+* Added support for getting custom download directory with `xdg-user-dir`.
+* Added support for updating homeserver URL based on well-known data in
+  `/login` response.
+* Updated some places to use default color instead of white to better work on
+  light themed terminals (thanks to [@zavok] in [#280]).
+* Updated notification library to work on all unix-like systems with `notify-send`.
+    * Notification sounds will now work if either `paplay` or `ogg123` is available.
+    * Based on work by [@negatethis] (in [#298]) and [@begss] (in [#312]).
+* Disabled logging request content for sensitive requests like `/login` and
+  cross-signing key uploads.
+* Fixed caching state of rooms where the room ID contains slashes.
+* Fixed index error in fuzzy search (thanks to [@Evidlo] in [#268]).
+
+[@gsauthof]: https://github.com/gsauthof
+[@octeep]: https://github.com/octeep
+[@lxea]: https://github.com/lxea
+[@zavok]: https://github.com/zavok
+[@negatethis]: https://github.com/negatethis
+[@begss]: https://github.com/begss
+[@Evidlo]: https://github.com/Evidlo
+[#261]: https://github.com/gomuks/gomuks/pull/261
+[#268]: https://github.com/gomuks/gomuks/pull/268
+[#270]: https://github.com/gomuks/gomuks/pull/270
+[#280]: https://github.com/gomuks/gomuks/pull/280
+[#298]: https://github.com/gomuks/gomuks/pull/298
+[#304]: https://github.com/gomuks/gomuks/pull/304
+[#312]: https://github.com/gomuks/gomuks/pull/312
+
+# v0.2.3 (2021-02-19)
+
+* Switched crypto store to use SQLite to prevent it from getting corrupted all
+  the time.
+* Added macOS builds (both x86 and arm64).
+* Allowed password login to servers with both SSO and password login enabled.
+
+# v0.2.2 (2021-01-06)
+
+* Added some initial cross-signing/SSSS commands.
+* Updated mautrix-go to fix Go 1.15.3+ compatibility.
+* Fixed text selection panic caused by clipboard.
+* Fixed incoming encryption state events not being detected.
+* Fixed zombie processes left from opening files (thanks to [@Midek] in [#234]).
+
+[@Midek]: https://github.com/Midek
+[#234]: https://github.com/gomuks/gomuks/pull/234
+
+# v0.2.1 (2020-10-23)
+
+* Moved help into a modal (partially done by [@wvffle] in [#223]).
+* Fixed choosing a login flow when logging in.
+* Fixed edits by different users than the original message sender being rendered.
+* Fixed panic when rendering empty code block.
+* Fixed panic in `/open` command (thanks to [@dec05eba] in [#226]).
+* Fixed command autocompletion (thanks to [@wvffle] in [#222]).
+
+[@dec05eba]: https://github.com/dec05eba
+[#222]: https://github.com/gomuks/gomuks/pull/222
+[#223]: https://github.com/gomuks/gomuks/pull/223
+[#226]: https://github.com/gomuks/gomuks/pull/226
+
+# v0.2.0 (2020-09-04)
+
+* Added interactive device verification support (only outgoing requests currently).
+* Added option to show inline link target as text (thanks to [@r3k2] in [#189]).
+* Added `/edit` command as an alternative to <kbd>↑</kbd>/<kbd>↓</kbd>.
+* Added support for importing and exporting message decryption keys.
+* Added command for uploading files (started by [@wvffle] in [#206]).
+* Added parameter autocompletion for some commands (mostly the new crypto and
+  upload commands, but also `/download` and `/open`).
+* Fixed autocompleting HTML pills when markdown is disabled.
+* Fixed editing the same message many times.
+* Fixed mangled comment newlines in code blocks (thanks to [@wvffle] in [#214]).
+
+[@wvffle]: https://github.com/wvffle
+[@r3k2]: https://github.com/r3k2
+[#189]: https://github.com/gomuks/gomuks/pull/189
+[#206]: https://github.com/gomuks/gomuks/pull/206
+[#214]: https://github.com/gomuks/gomuks/pull/214
+
+# v0.1.2 (2020-06-24)
+
+* Fixed panic when clicking <kbd>Shift</kbd>+<kbd>Tab</kbd> on the first item
+  of the fuzzy room search dialog.
+* Fixed panic when rendering `m.room.canonical_alias` events with no
+  `prev_content`.
+* Fixed rendering displayname changes.
+
+# v0.1.1 (2020-06-24)
+
+No changelog available.
+
+# v0.1.0 (2020-05-10)
+
+Initial release.

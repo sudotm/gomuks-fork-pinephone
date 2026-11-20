@@ -1,0 +1,107 @@
+// gomuks - A Matrix client written in Go.
+// Copyright (C) 2024 Tulir Asokan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"runtime"
+
+	"github.com/chzyer/readline"
+	"go.mau.fi/util/exhttp"
+	"go.mau.fi/util/progver"
+	flag "maunium.net/go/mauflag"
+	"maunium.net/go/mautrix"
+
+	"go.mau.fi/gomuks/pkg/gomuks"
+	"go.mau.fi/gomuks/pkg/hicli"
+	"go.mau.fi/gomuks/version"
+	"go.mau.fi/gomuks/web"
+)
+
+var wantHelp, _ = flag.MakeHelpFlag()
+var wantVersion = flag.MakeFull("v", "version", "View gomuks version and quit.", "false").Bool()
+var versionJSON = flag.Make().LongKey("version-json").Usage("Print a JSON object representing the gomuks version and quit.").Default("false").Bool()
+var update = flag.MakeFull("u", "update", "Update the binary in-place and quit.", "false").Bool()
+var desktopMode = flag.MakeFull("", "desktop", "Indicate that the backend is running as a subprocess in the desktop app", "false").Bool()
+
+type VersionJSONOutput struct {
+	progver.ProgramVersion
+
+	OS   string
+	Arch string
+
+	Mautrix struct {
+		Version string
+		Commit  string
+	}
+}
+
+func main() {
+	gomuks.PromptInput = readline.Line
+	gomuks.PromptPassword = readline.Password
+	hicli.DefaultInitialDeviceDisplayName = "gomuks web"
+	if *desktopMode {
+		hicli.DefaultInitialDeviceDisplayName = "gomuks desktop"
+	}
+	exhttp.AutoAllowCORS = false
+	flag.SetHelpTitles(
+		"gomuks - A Matrix client written in Go.",
+		"gomuks [-hv]",
+	)
+	err := flag.Parse()
+
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, err)
+		flag.PrintHelp()
+		os.Exit(1)
+	} else if *wantHelp {
+		flag.PrintHelp()
+		os.Exit(0)
+	} else if *wantVersion {
+		fmt.Println(version.Gomuks.VersionDescription)
+		os.Exit(0)
+	} else if *versionJSON {
+		output := VersionJSONOutput{
+			ProgramVersion: version.Gomuks,
+
+			OS:   runtime.GOOS,
+			Arch: runtime.GOARCH,
+		}
+		output.Mautrix.Commit = mautrix.Commit
+		output.Mautrix.Version = mautrix.Version
+		_ = json.NewEncoder(os.Stdout).Encode(output)
+		os.Exit(0)
+	} else if *update {
+		updated, err := doUpdate()
+		if err != nil {
+			_, _ = fmt.Fprintln(os.Stderr, "Update failed:", err)
+			os.Exit(1)
+		} else if !updated {
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
+
+	gmx := gomuks.NewGomuks()
+	if *desktopMode {
+		gmx.DesktopKey = os.Getenv("GOMUKS_DESKTOP_KEY")
+	}
+	gmx.FrontendFS = web.Frontend
+	gmx.Run()
+}

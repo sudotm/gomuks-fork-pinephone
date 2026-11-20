@@ -1,0 +1,515 @@
+// gomuks - A Matrix client written in Go.
+// Copyright (C) 2024 Tulir Asokan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package gomuks
+
+import (
+	"bytes"
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"html"
+	"io"
+	"io/fs"
+	"net"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/alecthomas/chroma/v2/styles"
+	"github.com/klauspost/compress/gzip"
+	"github.com/klauspost/compress/zstd"
+	"github.com/rs/zerolog/hlog"
+	"go.mau.fi/util/exerrors"
+	"go.mau.fi/util/exhttp"
+	"go.mau.fi/util/jsontime"
+	"go.mau.fi/util/ptr"
+	"go.mau.fi/util/requestlog"
+	"golang.org/x/crypto/bcrypt"
+	"maunium.net/go/mautrix"
+
+	"go.mau.fi/gomuks/pkg/hicli"
+	"go.mau.fi/gomuks/pkg/hicli/jsoncmd"
+	"go.mau.fi/gomuks/version"
+)
+
+func (gmx *Gomuks) CreateAPIRouter() http.Handler {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /websocket", gmx.HandleWebsocket)
+	api.HandleFunc("GET /sse", gmx.HandleSSE)
+	api.HandleFunc("POST /sse/ping", gmx.HandleSSEPing)
+	api.HandleFunc("POST /auth", gmx.Authenticate)
+	api.HandleFunc("POST /upload", gmx.UploadMediaHTTP)
+	api.HandleFunc("GET /media/{server}/{media_id}", gmx.DownloadMediaHTTP)
+	api.HandleFunc("POST /exec/{command}", gmx.ExecCommand)
+	api.HandleFunc("POST /keys/export", gmx.ExportKeys)
+	api.HandleFunc("POST /keys/export/{room_id}", gmx.ExportKeys)
+	api.HandleFunc("POST /keys/import", gmx.ImportKeys)
+	api.HandleFunc("GET /keys/restorebackup", gmx.RestoreKeyBackup)
+	api.HandleFunc("GET /keys/restorebackup/{room_id}", gmx.RestoreKeyBackup)
+	api.HandleFunc("GET /codeblock/{style}", gmx.GetCodeblockCSS)
+	api.HandleFunc("GET /theme/{id}", gmx.GetThemeProxy)
+	api.HandleFunc("GET /theme/{id}/commit/{commit}", gmx.GetThemeProxy)
+	api.HandleFunc("GET /url_preview", gmx.GetURLPreviewHTTP)
+	return exhttp.ApplyMiddleware(
+		api,
+		hlog.NewHandler(*gmx.Log),
+		hlog.RequestIDHandler("request_id", "Request-ID"),
+		requestlog.AccessLogger(requestlog.Options{}),
+	)
+}
+
+const metaTagsTemplate = `
+	<meta name="gomuks-frontend-etag" content="%s">
+	<meta name="gomuks-version-description" content="%s">
+	<meta name="gomuks-vapid-key" content="%s">
+	<script type="text/javascript">
+		window.gomuksDefaultConfig = %s
+	</script>
+`
+
+func (gmx *Gomuks) StartServer() {
+	api := gmx.CreateAPIRouter()
+	router := http.NewServeMux()
+	if gmx.Config.Web.DebugEndpoints {
+		router.Handle("/debug/", http.DefaultServeMux)
+	}
+	router.Handle("/_gomuks/", exhttp.ApplyMiddleware(
+		api,
+		exhttp.StripPrefix("/_gomuks"),
+		gmx.AuthMiddleware,
+	))
+	if frontend, err := fs.Sub(gmx.FrontendFS, "dist"); err != nil {
+		gmx.Log.Warn().Err(err).Msg("Frontend not found")
+	} else if indexFile, err := frontend.Open("index.html"); err != nil {
+		gmx.Log.Warn().Err(err).Msg("Failed to open frontend index.html")
+	} else {
+		router.Handle("/", gmx.FrontendCacheMiddleware(http.FileServerFS(frontend)))
+		if version.Gomuks.Commit != "unknown" && !version.Gomuks.BuildTime.IsZero() {
+			gmx.frontendETag = fmt.Sprintf(`"%s-%s"`, version.Gomuks.Commit, version.Gomuks.BuildTime.Format(time.RFC3339))
+		}
+		data, err := io.ReadAll(indexFile)
+		_ = indexFile.Close()
+		if err != nil {
+			gmx.Log.Fatal().Err(err).Msg("Failed to read index.html")
+		}
+		gmx.indexWithMeta = bytes.Replace(
+			data,
+			[]byte("<!-- etag placeholder -->"),
+			[]byte(fmt.Sprintf(
+				metaTagsTemplate,
+				html.EscapeString(gmx.frontendETag),
+				html.EscapeString(version.Gomuks.VersionDescription),
+				gmx.Config.Push.VAPIDPublicKey,
+				exerrors.Must(json.Marshal(gmx.Config.Web.DefaultPreferences)),
+			)),
+			1,
+		)
+		gmx.indexETag = fmt.Sprintf(`"%x"`, sha256.Sum256(gmx.indexWithMeta))
+	}
+	gmx.Server = &http.Server{Handler: router, Protocols: &http.Protocols{}}
+	gmx.Server.Protocols.SetHTTP1(true)
+	enableTLS := gmx.Config.Web.TLSCertFile != "" && gmx.Config.Web.TLSKeyFile != ""
+	gmx.Server.Protocols.SetUnencryptedHTTP2(!enableTLS)
+	gmx.Server.Protocols.SetHTTP2(enableTLS)
+	gmx.Log.Info().Str("address", gmx.Config.Web.ListenAddress).Msg("Starting server")
+	var ln net.Listener
+	if strings.HasPrefix(gmx.Config.Web.ListenAddress, "unix:") {
+		socketPath := strings.TrimPrefix(gmx.Config.Web.ListenAddress, "unix:")
+		if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			gmx.Log.Err(err).Str("socket_path", socketPath).Msg("Failed to remove existing socket file")
+		}
+		ln = exerrors.Must(net.Listen("unix", socketPath))
+	} else {
+		ln = exerrors.Must(net.Listen("tcp", gmx.Config.Web.ListenAddress))
+	}
+	gmx.Server.Addr = ln.Addr().String()
+	go func() {
+		var err error
+		if enableTLS {
+			err = gmx.Server.ServeTLS(ln, gmx.Config.Web.TLSCertFile, gmx.Config.Web.TLSKeyFile)
+		} else {
+			err = gmx.Server.Serve(ln)
+		}
+		_ = ln.Close()
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			panic(err)
+		}
+	}()
+	gmx.Log.Info().Str("address", gmx.Server.Addr).Bool("tls", enableTLS).Msg("Server started")
+	if gmx.DesktopKey != "" {
+		out := exerrors.Must(json.Marshal(map[string]any{"started": true, "address": gmx.Server.Addr}))
+		fmt.Printf("%s\n", out)
+	}
+}
+
+func (gmx *Gomuks) FrontendCacheMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" && gmx.frontendETag != "" && r.Header.Get("If-None-Match") == gmx.frontendETag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		} else if r.URL.Path == "/" && gmx.indexETag != "" && r.Header.Get("If-None-Match") == gmx.indexETag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/assets/") {
+			w.Header().Set("Cache-Control", "max-age=604800, immutable")
+		}
+		if r.URL.Path == "/" {
+			w.Header().Set("Content-Type", "text/html")
+			w.Header().Set("Content-Length", strconv.Itoa(len(gmx.indexWithMeta)))
+			if gmx.indexETag != "" {
+				w.Header().Set("ETag", gmx.indexETag)
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(gmx.indexWithMeta)
+			return
+		} else if gmx.frontendETag != "" {
+			w.Header().Set("ETag", gmx.frontendETag)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+var (
+	ErrInvalidHeader = mautrix.RespError{ErrCode: "FI.MAU.GOMUKS.INVALID_HEADER", StatusCode: http.StatusForbidden}
+	ErrMissingCookie = mautrix.RespError{ErrCode: "FI.MAU.GOMUKS.MISSING_COOKIE", Err: "Missing gomuks_auth cookie", StatusCode: http.StatusUnauthorized}
+	ErrInvalidCookie = mautrix.RespError{ErrCode: "FI.MAU.GOMUKS.INVALID_COOKIE", Err: "Invalid gomuks_auth cookie", StatusCode: http.StatusUnauthorized}
+)
+
+type tokenData struct {
+	Username  string        `json:"username"`
+	Expiry    jsontime.Unix `json:"expiry"`
+	ImageOnly bool          `json:"image_only,omitempty"`
+}
+
+func (gmx *Gomuks) validateToken(token string, output any) bool {
+	if len(token) > 4096 {
+		return false
+	}
+	parts := strings.Split(token, ".")
+	if len(parts) != 2 {
+		return false
+	}
+	rawJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return false
+	}
+	checksum, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return false
+	}
+	hasher := hmac.New(sha256.New, []byte(gmx.Config.Web.TokenKey))
+	hasher.Write(rawJSON)
+	if !hmac.Equal(hasher.Sum(nil), checksum) {
+		return false
+	}
+
+	err = json.Unmarshal(rawJSON, output)
+	return err == nil
+}
+
+func (gmx *Gomuks) validateAuth(token string, imageOnly bool) bool {
+	if gmx.Config.Web.DisableAuthBecauseIWantMyAccountToBeHacked {
+		return true
+	}
+	if len(token) > 500 {
+		return false
+	}
+	var td tokenData
+	return gmx.validateToken(token, &td) &&
+		td.Username == gmx.Config.Web.Username &&
+		td.Expiry.After(time.Now()) &&
+		td.ImageOnly == imageOnly
+}
+
+func (gmx *Gomuks) generateToken() (string, time.Time) {
+	expiry := time.Now().Add(7 * 24 * time.Hour)
+	return gmx.signToken(tokenData{
+		Username: gmx.Config.Web.Username,
+		Expiry:   jsontime.U(expiry),
+	}), expiry
+}
+
+func (gmx *Gomuks) generateImageToken(expiry time.Duration) jsoncmd.ImageAuthToken {
+	return jsoncmd.ImageAuthToken(gmx.signToken(tokenData{
+		Username:  gmx.Config.Web.Username,
+		Expiry:    jsontime.U(time.Now().Add(expiry)),
+		ImageOnly: true,
+	}))
+}
+
+func (gmx *Gomuks) signToken(td any) string {
+	data := exerrors.Must(json.Marshal(td))
+	hasher := hmac.New(sha256.New, []byte(gmx.Config.Web.TokenKey))
+	hasher.Write(data)
+	checksum := hasher.Sum(nil)
+	return base64.RawURLEncoding.EncodeToString(data) + "." + base64.RawURLEncoding.EncodeToString(checksum)
+}
+
+func (gmx *Gomuks) writeTokenCookie(w http.ResponseWriter, created, jsonOutput, insecureCookie bool) {
+	token, expiry := gmx.generateToken()
+	if !jsonOutput {
+		http.SetCookie(w, &http.Cookie{
+			Name:     "gomuks_auth",
+			Value:    token,
+			Expires:  expiry,
+			HttpOnly: true,
+			Secure:   !insecureCookie,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+	if created {
+		w.WriteHeader(http.StatusCreated)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	if jsonOutput {
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": token})
+	}
+}
+
+func (gmx *Gomuks) Authenticate(w http.ResponseWriter, r *http.Request) {
+	if gmx.DisableAuth || gmx.Config.Web.DisableAuthBecauseIWantMyAccountToBeHacked {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	jsonOutput := r.URL.Query().Get("output") == "json"
+	allowPrompt := r.URL.Query().Get("no_prompt") != "true"
+	// Non-web clients are allowed to opt into insecure cookies, web clients will only get them if the config says so
+	insecureCookie := (r.URL.Query().Get("insecure_cookie") == "true" && r.Header.Get("Sec-Fetch-Site") == "") ||
+		gmx.Config.Web.InsecureCookies
+	secureContext := r.URL.Query().Get("secure") != "false"
+	if !secureContext && !insecureCookie {
+		// If the user is trying to connect from an insecure context without allowing insecure cookies,
+		// fail the request immediately to avoid confusion about why the cookie isn't working.
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("Backend is not configured to allow insecure cookies"))
+		return
+	}
+	authCookie, err := r.Cookie("gomuks_auth")
+	if err == nil && gmx.validateAuth(authCookie.Value, false) {
+		hlog.FromRequest(r).Debug().Msg("Authentication successful with existing cookie")
+		gmx.writeTokenCookie(w, false, jsonOutput, insecureCookie)
+	} else if found, correct := gmx.doBasicAuth(r); found && correct {
+		hlog.FromRequest(r).Debug().Msg("Authentication successful with username and password")
+		gmx.writeTokenCookie(w, true, jsonOutput, insecureCookie)
+	} else {
+		if allowPrompt {
+			w.Header().Set("WWW-Authenticate", `Basic realm="gomuks web" charset="UTF-8"`)
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		if !found {
+			hlog.FromRequest(r).Debug().Msg("Requesting credentials for auth request")
+			_, _ = w.Write([]byte("Missing basic auth credentials"))
+		} else {
+			hlog.FromRequest(r).Debug().Msg("Authentication failed with username and password, re-requesting credentials")
+			_, _ = w.Write([]byte("Incorrect basic auth credentials"))
+		}
+	}
+}
+
+func ctEqualString(expected, got string) bool {
+	if expected == "" || got == "" {
+		return false
+	}
+	gotHash := sha256.Sum256([]byte(got))
+	expectedHash := sha256.Sum256([]byte(expected))
+	return hmac.Equal(gotHash[:], expectedHash[:])
+}
+
+func (gmx *Gomuks) doBasicAuth(r *http.Request) (found, correct bool) {
+	var username, password string
+	username, password, found = r.BasicAuth()
+	if !found {
+		return
+	}
+	if gmx.DesktopKey != "" && username == "desktop-key" {
+		correct = ctEqualString(gmx.DesktopKey, password)
+		return
+	}
+	usernameCorrect := ctEqualString(gmx.Config.Web.Username, username)
+	passwordCorrect := bcrypt.CompareHashAndPassword([]byte(gmx.Config.Web.PasswordHash), []byte(password)) == nil
+	correct = passwordCorrect && usernameCorrect
+	return
+}
+
+func getImageAuthToken(r *http.Request) string {
+	hdr := r.Header.Get("Authorization")
+	if strings.HasPrefix(hdr, "Image ") {
+		return strings.TrimPrefix(hdr, "Image ")
+	}
+	return r.URL.Query().Get("image_auth")
+}
+
+func (gmx *Gomuks) AuthMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/media") &&
+			gmx.validateAuth(getImageAuthToken(r), true) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if r.URL.Path != "/auth" && !gmx.Config.Web.DisableAuthBecauseIWantMyAccountToBeHacked {
+			authCookie, err := r.Cookie("gomuks_auth")
+			if err != nil {
+				found, valid := gmx.doBasicAuth(r)
+				if !found || !valid {
+					ErrMissingCookie.Write(w)
+					return
+				}
+			} else if !gmx.validateAuth(authCookie.Value, false) {
+				http.SetCookie(w, &http.Cookie{
+					Name:   "gomuks_auth",
+					MaxAge: -1,
+				})
+				ErrInvalidCookie.Write(w)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (gmx *Gomuks) GetCodeblockCSS(w http.ResponseWriter, r *http.Request) {
+	styleName := r.PathValue("style")
+	if !strings.HasSuffix(styleName, ".css") {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	style := styles.Get(strings.TrimSuffix(styleName, ".css"))
+	if style == nil {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "text/css")
+	_ = hicli.CodeBlockFormatter.WriteCSS(w, style)
+}
+
+var ErrTimeDesync = mautrix.RespError{
+	ErrCode:    "FI.MAU.GOMUKS.TIME_DESYNC",
+	Err:        "Client clock is too far in the future",
+	StatusCode: http.StatusBadRequest,
+}
+
+var ErrRequestExpired = mautrix.RespError{
+	ErrCode:    "FI.MAU.GOMUKS.REQUEST_EXPIRED",
+	Err:        "Client clock is too far in the past or request cache has already expired",
+	StatusCode: http.StatusBadRequest,
+}
+
+func checkClientTS(w http.ResponseWriter, clientTSStr string) bool {
+	clientTSInt, err := strconv.ParseInt(clientTSStr, 10, 64)
+	if err != nil {
+		mautrix.MInvalidParam.WithMessage("Failed to parse client timestamp: %v", err).Write(w)
+	} else if clientTS := time.UnixMilli(clientTSInt); time.Until(clientTS) > ExecutionBufferCleanupDelay/10 {
+		ErrTimeDesync.Write(w)
+	} else if time.Since(clientTS) > ExecutionBufferCleanupDelay/2 {
+		ErrRequestExpired.Write(w)
+	} else {
+		return true
+	}
+	return false
+}
+
+func compressResp(accept string, data []byte) (out []byte, enc string) {
+	if len(data) < 1024 {
+		return data, ""
+	}
+	if strings.Contains(accept, "zstd") {
+		return zstd.EncodeTo(nil, data), "zstd"
+	} else if strings.Contains(accept, "gzip") {
+		var buf bytes.Buffer
+		w := gzip.NewWriter(&buf)
+		_, err := w.Write(data)
+		if err != nil {
+			_ = w.Close()
+		} else if err = w.Close(); err != nil {
+		} else {
+			return buf.Bytes(), "gzip"
+		}
+	}
+	return data, ""
+}
+
+func (gmx *Gomuks) ExecCommand(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	txnID := q.Get("txn_id")
+	clientTSStr := q.Get("start_ts")
+	if txnID != "" && !checkClientTS(w, clientTSStr) {
+		return
+	}
+	log := hlog.FromRequest(r)
+	reqPayload, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Err(err).Msg("Failed to read command request body")
+		mautrix.MBadJSON.WithMessage("Failed to read request body: %v", err).Write(w)
+		return
+	} else if !json.Valid(reqPayload) {
+		mautrix.MBadJSON.WithMessage("Request body is not valid JSON").Write(w)
+		return
+	}
+	respData, respErr := gmx.execBuffer.Do(r.Context(), txnID, func(ctx context.Context) (json.RawMessage, *mautrix.RespError) {
+		resp := gmx.Client.SubmitJSONCommand(ctx, &hicli.JSONCommand{
+			Command: jsoncmd.Name(r.PathValue("command")),
+			Data:    reqPayload,
+		})
+		switch resp.Command {
+		case jsoncmd.RespError:
+			var errString string
+			_ = json.Unmarshal(resp.Data, &errString)
+			return nil, &mautrix.RespError{
+				ErrCode:    "FI.MAU.GOMUKS.COMMAND_ERROR",
+				Err:        errString,
+				StatusCode: http.StatusTeapot,
+			}
+		case jsoncmd.RespSuccess:
+			return resp.Data, nil
+		default:
+			log.Warn().Stringer("response_command", resp.Command).
+				Msg("Received unknown response command from JSON command execution")
+			return nil, ptr.Ptr(mautrix.MUnknown.WithMessage("Unexpected response command: %s", resp.Command))
+		}
+	})
+	if respErr != nil {
+		respErr.Write(w)
+	} else {
+		compressedData, enc := compressResp(r.Header.Get("Accept-Encoding"), respData)
+		if enc != "" {
+			w.Header().Set("Content-Encoding", enc)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", strconv.Itoa(len(compressedData)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(compressedData)
+	}
+}
+
+func isJSFetch(r *http.Request) bool {
+	secFetchDest := r.Header.Get("Sec-Fetch-Dest")
+	return secFetchDest == "" || secFetchDest == "empty"
+}
+
+func isJSWebsocket(r *http.Request) bool {
+	secFetchDest := r.Header.Get("Sec-Fetch-Dest")
+	return secFetchDest == "" || secFetchDest == "empty" || secFetchDest == "websocket"
+}

@@ -1,0 +1,55 @@
+div.room-view {
+	grid-area: roomview;
+	overflow: hidden;
+	height: 100%;
+	display: grid;
+	outline: none;
+	grid-template:
+		"header" var(--window-top-margin)
+		"header" 3.5rem
+		"messageview" 1fr
+		"autocomplete" 0
+		"input" auto
+		"typing" auto
+		"blank" var(--window-bottom-margin)
+		/ 1fr;
+	contain: strict;
+
+	&.preview {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+	}
+
+	> div.room-timeline-error, > div.room-header-error {
+		display: flex;
+		justify-content: center;
+		align-items: center;
+		height: 100%;
+
+		&.room-timeline-error {
+			grid-area: messageview;
+		}
+
+		&.room-header-error {
+			grid-area: header;
+		}
+	}
+
+	> div.file-drop-overlay {
+		position: absolute;
+		background: var(--file-drop-background-color);
+		z-index: 10;
+		inset: 0;
+
+		display: flex;
+		justify-content: center;
+		align-items: center;
+
+		> svg {
+			width: 8rem;
+			height: 8rem;
+			pointer-events: none;
+		}
+	}
+}

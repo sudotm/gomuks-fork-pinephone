@@ -1,0 +1,253 @@
+// gomuks - A Matrix client written in Go.
+// Copyright (C) 2025 Tulir Asokan
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+package gomuks
+
+import (
+	"cmp"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/jsontime"
+	"go.mau.fi/util/ptr"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
+
+	"go.mau.fi/gomuks/pkg/hicli/database"
+	"go.mau.fi/gomuks/pkg/hicli/jsoncmd"
+)
+
+type PushNewMessage struct {
+	Timestamp  jsontime.UnixMilli  `json:"timestamp"`
+	EventID    id.EventID          `json:"event_id"`
+	EventRowID database.EventRowID `json:"event_rowid"`
+
+	RoomID     id.RoomID        `json:"room_id"`
+	RoomName   string           `json:"room_name"`
+	RoomAvatar string           `json:"room_avatar,omitempty"`
+	IsDM       bool             `json:"is_dm,omitzero"`
+	Sender     NotificationUser `json:"sender"`
+	Self       NotificationUser `json:"self"`
+
+	PerMessageProfile NotificationUser `json:"per_message_profile,omitzero"`
+
+	Text    string `json:"text"`
+	Image   string `json:"image,omitempty"`
+	Mention bool   `json:"mention,omitzero"`
+	Reply   bool   `json:"reply,omitzero"`
+	Sound   bool   `json:"sound,omitzero"`
+}
+
+func (gmx *Gomuks) getFilePath(ctx context.Context, url string) string {
+	mxc := downloadURLPathToMXC(url)
+	if !mxc.IsValid() {
+		return ""
+	}
+	media, err := gmx.Client.DB.Media.Get(ctx, mxc)
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Str("url", url).Msg("Failed to get media for desktop notification")
+	} else if media != nil {
+		if media.ThumbnailHash != nil {
+			return gmx.CacheEntryToPath(media.ThumbnailHash)
+		} else if media.Hash != nil {
+			return gmx.CacheEntryToPath(media.Hash)
+		}
+	}
+	return ""
+}
+
+func downloadURLPathToMXC(url string) (mxc id.ContentURI) {
+	unprefixed, ok := strings.CutPrefix(url, "_gomuks/media/")
+	if !ok {
+		return
+	}
+	queryIdx := strings.IndexByte(unprefixed, '?')
+	if queryIdx == -1 {
+		return
+	}
+	parts := strings.Split(unprefixed[:queryIdx], "/")
+	if len(parts) != 2 {
+		return
+	}
+	return id.ContentURI{
+		Homeserver: parts[0],
+		FileID:     parts[1],
+	}
+}
+
+func (gmx *Gomuks) toDesktopNotification(ctx context.Context, pnm PushNewMessage) PushNewMessage {
+	pnm.RoomAvatar = gmx.getFilePath(ctx, pnm.RoomAvatar)
+	pnm.Sender.Avatar = gmx.getFilePath(ctx, pnm.Sender.Avatar)
+	pnm.PerMessageProfile.Avatar = gmx.getFilePath(ctx, pnm.PerMessageProfile.Avatar)
+	pnm.Self.Avatar = gmx.getFilePath(ctx, pnm.Self.Avatar)
+	pnm.Image = gmx.getFilePath(ctx, pnm.Image)
+	return pnm
+}
+
+func (pnm *PushNewMessage) toFFINotification() *PushNewMessage {
+	if pnm == nil {
+		return nil
+	}
+	pnm.RoomAvatar = downloadURLPathToMXC(pnm.RoomAvatar).String()
+	pnm.Sender.Avatar = downloadURLPathToMXC(pnm.Sender.Avatar).String()
+	pnm.PerMessageProfile.Avatar = downloadURLPathToMXC(pnm.PerMessageProfile.Avatar).String()
+	pnm.Self.Avatar = downloadURLPathToMXC(pnm.Self.Avatar).String()
+	pnm.Image = downloadURLPathToMXC(pnm.Image).String()
+	return pnm
+}
+
+type NotificationUser struct {
+	ID     id.UserID `json:"id"`
+	Name   string    `json:"name"`
+	Avatar string    `json:"avatar,omitempty"`
+}
+
+func (nu NotificationUser) IsZero() bool {
+	return nu.ID == "" && nu.Name == "" && nu.Avatar == ""
+}
+
+func getAvatarLinkForNotification(name, ident string, uri id.ContentURIString) string {
+	if len(uri) > 255 {
+		return ""
+	}
+	parsed := uri.ParseOrIgnore()
+	if !parsed.IsValid() {
+		return ""
+	}
+	var fallbackChar rune
+	if name == "" {
+		fallbackChar, _ = utf8.DecodeRuneInString(ident[1:])
+	} else {
+		fallbackChar, _ = utf8.DecodeRuneInString(name)
+	}
+	return fmt.Sprintf("_gomuks/media/%s/%s?encrypted=false&fallback=%s", parsed.Homeserver, parsed.FileID, url.QueryEscape(string(fallbackChar)))
+}
+
+func (gmx *Gomuks) getNotificationUser(ctx context.Context, roomID id.RoomID, userID id.UserID) (user NotificationUser) {
+	user = NotificationUser{ID: userID, Name: userID.Localpart()}
+	memberEvt, err := gmx.Client.DB.CurrentState.Get(ctx, roomID, event.StateMember, userID.String())
+	if err != nil {
+		zerolog.Ctx(ctx).Err(err).Stringer("of_user_id", userID).Msg("Failed to get member event")
+		return
+	} else if memberEvt == nil {
+		return
+	}
+	var memberContent event.MemberEventContent
+	_ = json.Unmarshal(memberEvt.Content, &memberContent)
+	if memberContent.Displayname != "" {
+		user.Name = memberContent.Displayname
+	}
+	if len(user.Name) > 50 {
+		user.Name = user.Name[:50] + "…"
+	}
+	if memberContent.AvatarURL != "" {
+		user.Avatar = getAvatarLinkForNotification(memberContent.Displayname, userID.String(), memberContent.AvatarURL)
+	}
+	return
+}
+
+func (gmx *Gomuks) formatPushNotificationMessage(ctx context.Context, notif *jsoncmd.SyncNotification) *PushNewMessage {
+	evtType := notif.Event.GetType()
+	rawContent := notif.Event.Content
+	if notif.Event.Decrypted != nil {
+		rawContent = notif.Event.Decrypted
+	}
+	if evtType != event.EventMessage && evtType != event.EventSticker {
+		return nil
+	}
+	var content event.MessageEventContent
+	err := json.Unmarshal(rawContent, &content)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Stringer("event_id", notif.Event.ID).
+			Msg("Failed to unmarshal message content to format push notification")
+		return nil
+	}
+	var roomAvatar, image string
+	isDM := ptr.Val(notif.Room.DMUserID) != ""
+	if notif.Room.Avatar != nil {
+		avatarIdent := notif.Room.ID.String()
+		if isDM {
+			avatarIdent = notif.Room.DMUserID.String()
+		}
+		roomAvatar = getAvatarLinkForNotification(ptr.Val(notif.Room.Name), avatarIdent, notif.Room.Avatar.CUString())
+	}
+	roomName := ptr.Val(notif.Room.Name)
+	if roomName == "" {
+		roomName = "Unnamed room"
+	}
+	if len(roomName) > 50 {
+		roomName = roomName[:50] + "…"
+	}
+	if content.MsgType == event.MsgImage || evtType == event.EventSticker {
+		if content.File != nil && content.File.URL != "" {
+			parsed := content.File.URL.ParseOrIgnore()
+			if len(content.File.URL) < 255 && parsed.IsValid() {
+				image = fmt.Sprintf("_gomuks/media/%s/%s?encrypted=true", parsed.Homeserver, parsed.FileID)
+			}
+		} else if content.URL != "" {
+			parsed := content.URL.ParseOrIgnore()
+			if len(content.URL) < 255 && parsed.IsValid() {
+				image = fmt.Sprintf("_gomuks/media/%s/%s?encrypted=false", parsed.Homeserver, parsed.FileID)
+			}
+		}
+	}
+	senderUser := gmx.getNotificationUser(ctx, notif.Room.ID, notif.Event.Sender)
+	var pmp NotificationUser
+	if content.BeeperPerMessageProfile != nil {
+		name := cmp.Or(content.BeeperPerMessageProfile.Displayname, senderUser.Name)
+		ident := cmp.Or(content.BeeperPerMessageProfile.ID, notif.Event.Sender.String())
+		pmp = NotificationUser{
+			ID:     id.UserID(ident),
+			Name:   name,
+			Avatar: getAvatarLinkForNotification(name, ident, ptr.Val(content.BeeperPerMessageProfile.AvatarURL)),
+		}
+		if len(pmp.ID) > 255 {
+			idHash := sha256.Sum256([]byte(pmp.ID))
+			pmp.ID = id.UserID(hex.EncodeToString(idHash[:]))
+		}
+		if len(pmp.Name) > 50 {
+			pmp.Name = pmp.Name[:50] + "…"
+		}
+	}
+	return &PushNewMessage{
+		Timestamp:  notif.Event.Timestamp,
+		EventID:    notif.Event.ID,
+		EventRowID: notif.Event.RowID,
+
+		RoomID:     notif.Room.ID,
+		RoomName:   roomName,
+		RoomAvatar: roomAvatar,
+		IsDM:       isDM,
+		Sender:     senderUser,
+		Self:       gmx.getNotificationUser(ctx, notif.Room.ID, gmx.Client.Account.UserID),
+
+		PerMessageProfile: pmp,
+
+		Text:    notif.Event.LocalContent.PreviewText,
+		Image:   image,
+		Mention: content.Mentions.Has(gmx.Client.Account.UserID),
+		Reply:   content.RelatesTo.GetNonFallbackReplyTo() != "",
+		Sound:   notif.Sound,
+	}
+}
