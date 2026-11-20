@@ -37,6 +37,12 @@ import (
 	"go.mau.fi/gomuks/tui/debug"
 )
 
+// UserPreferences holds terminal-local UI settings.
+//
+// Missing fields keep the zero value. For the layout booleans that means the
+// ordinary upstream layout: room list, member list, timestamps, and the sender
+// column are all shown. inline_url_mode is empty unless set to "enable" or
+// "disable"; an empty value follows the terminal's automatic detection.
 type UserPreferences struct {
 	HideUserList         bool `yaml:"hide_user_list"`
 	HideRoomList         bool `yaml:"hide_room_list"`
@@ -107,7 +113,7 @@ type Config struct {
 
 	Dir string `yaml:"-"`
 
-	Preferences UserPreferences   `yaml:"-"`
+	Preferences UserPreferences   `yaml:"preferences,omitempty"`
 	Keybindings ParsedKeybindings `yaml:"-"`
 
 	nosave bool
@@ -167,11 +173,14 @@ func (config *Config) LoadAll() {
 	config.LoadKeybindings()
 }
 
-// Load loads the config from config.yaml in the directory given to the config struct.
+// Load loads terminal.yaml from the config directory.
+// A missing file leaves the defaults in place. A malformed file panics with the
+// path included and does not rewrite the file.
 func (config *Config) Load() {
+	path := filepath.Join(config.Dir, "terminal.yaml")
 	err := config.load("config", config.Dir, "terminal.yaml", config)
 	if err != nil {
-		panic(fmt.Errorf("failed to load config.yaml: %w", err))
+		panic(fmt.Errorf("failed to load %s: %w", path, err))
 	}
 }
 
@@ -278,9 +287,163 @@ func (config *Config) save(name, dir, file string, source interface{}) {
 	}
 
 	path := filepath.Join(dir, file)
-	err = os.WriteFile(path, data, 0600)
+	err = writeFileAtomic(path, data, 0600)
 	if err != nil {
 		debug.Print("Failed to write", name, "to", path)
 		panic(err)
 	}
+}
+
+// SavePreferences writes only the preferences key in terminal.yaml.
+// Other keys, including ones this version does not know about, are left as
+// they were. The existing file is not replaced if encoding or parsing fails.
+func (config *Config) SavePreferences() error {
+	if config.nosave {
+		return nil
+	}
+	if err := os.MkdirAll(config.Dir, 0700); err != nil {
+		return err
+	}
+	prefNode, err := encodeYAMLValue(config.Preferences)
+	if err != nil {
+		return err
+	}
+
+	path := filepath.Join(config.Dir, "terminal.yaml")
+	existing, readErr := os.ReadFile(path)
+	var root yaml.Node
+	switch {
+	case readErr == nil:
+		if strings.TrimSpace(string(existing)) == "" {
+			root = emptyYAMLDocument()
+		} else if err = yaml.Unmarshal(existing, &root); err != nil {
+			return fmt.Errorf("terminal.yaml is malformed; left it unchanged: %w", err)
+		}
+	case os.IsNotExist(readErr):
+		root = emptyYAMLDocument()
+	default:
+		return readErr
+	}
+
+	mapping, err := ensureYAMLMapping(&root)
+	if err != nil {
+		return fmt.Errorf("terminal.yaml is malformed; left it unchanged: %w", err)
+	}
+	upsertYAMLKey(mapping, "preferences", prefNode)
+	out, err := yaml.Marshal(&root)
+	if err != nil {
+		return err
+	}
+	return writeFileAtomic(path, out, 0600)
+}
+
+func encodeYAMLValue(value any) (*yaml.Node, error) {
+	data, err := yaml.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	var doc yaml.Node
+	if err = yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil, fmt.Errorf("failed to encode preferences")
+	}
+	return doc.Content[0], nil
+}
+
+func emptyYAMLDocument() yaml.Node {
+	return yaml.Node{
+		Kind: yaml.DocumentNode,
+		Content: []*yaml.Node{{
+			Kind: yaml.MappingNode,
+			Tag:  "!!map",
+		}},
+	}
+}
+
+func ensureYAMLMapping(doc *yaml.Node) (*yaml.Node, error) {
+	if doc.Kind == 0 {
+		*doc = emptyYAMLDocument()
+	}
+	if doc.Kind != yaml.DocumentNode {
+		return nil, fmt.Errorf("root node is %v, want a document", doc.Kind)
+	}
+	if len(doc.Content) == 0 {
+		doc.Content = emptyYAMLDocument().Content
+	}
+	mapping := doc.Content[0]
+	if mapping.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("root value is %v, want a mapping", mapping.Kind)
+	}
+	if mapping.Tag == "" {
+		mapping.Tag = "!!map"
+	}
+	return mapping, nil
+}
+
+func upsertYAMLKey(mapping *yaml.Node, key string, value *yaml.Node) {
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			mapping.Content[i+1] = value
+			return
+		}
+	}
+	mapping.Content = append(mapping.Content,
+		&yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key},
+		value,
+	)
+}
+
+// writeFileAtomic replaces path only after the new contents are fully written.
+// A failure leaves any existing file in place.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".terminal-yaml-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Chmod(perm); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmpName, path); err == nil {
+		cleanup = false
+		return nil
+	}
+	// Windows cannot replace an existing file via rename. Move the original
+	// aside first so a failed replacement can be restored.
+	backup := path + ".bak"
+	_ = os.Remove(backup)
+	if _, statErr := os.Stat(path); statErr == nil {
+		if err = os.Rename(path, backup); err != nil {
+			return err
+		}
+		if err = os.Rename(tmpName, path); err != nil {
+			_ = os.Rename(backup, path)
+			return err
+		}
+		cleanup = false
+		_ = os.Remove(backup)
+		return nil
+	}
+	if err = os.Rename(tmpName, path); err != nil {
+		return err
+	}
+	cleanup = false
+	return nil
 }
