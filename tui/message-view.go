@@ -170,10 +170,13 @@ func (view *MessageView) OnMouseEvent(event mauview.MouseEvent) bool {
 		view.lock.RUnlock()
 
 		usernameX := 0
-		if !view.config.Preferences.HideTimestamp {
-			usernameX += view.TimestampWidth + TimestampSenderGap
+		messageX := 0
+		if !view.config.Preferences.BareMessageView {
+			if !view.config.Preferences.HideTimestamp {
+				usernameX += view.TimestampWidth + TimestampSenderGap
+			}
+			messageX = usernameX + view.SenderWidth + SenderMessageGap
 		}
-		messageX := usernameX + view.SenderWidth + SenderMessageGap
 
 		if x >= messageX {
 			return view.handleMessageClick(message, event.Modifiers())
@@ -222,6 +225,23 @@ const (
 	SenderSeparatorGap = 1
 	SenderMessageGap   = 3
 )
+
+func messageTextWidth(contentWidth int, prefs config.UserPreferences, senderWidth, timestampWidth int) int {
+	if contentWidth < 0 {
+		return 0
+	}
+	if prefs.BareMessageView {
+		return contentWidth
+	}
+	textWidth := contentWidth - senderWidth - SenderMessageGap
+	if !prefs.HideTimestamp {
+		textWidth -= timestampWidth + TimestampSenderGap
+	}
+	if textWidth < 0 {
+		return 0
+	}
+	return textWidth
+}
 
 func getScrollbarStyle(scrollbarHere, isTop, isBottom bool) (char rune, style tcell.Style) {
 	char = '│'
@@ -311,14 +331,13 @@ func (view *MessageView) Draw(screen mauview.Screen) {
 	}
 
 	usernameX := 0
-	if !view.config.Preferences.HideTimestamp {
-		usernameX += view.TimestampWidth + TimestampSenderGap
-	}
-	messageX := usernameX + view.SenderWidth + SenderMessageGap
-
+	messageX := 0
 	bareMode := view.config.Preferences.BareMessageView
-	if bareMode {
-		messageX = 0
+	if !bareMode {
+		if !view.config.Preferences.HideTimestamp {
+			usernameX += view.TimestampWidth + TimestampSenderGap
+		}
+		messageX = usernameX + view.SenderWidth + SenderMessageGap
 	}
 
 	indexOffset := view.getIndexOffset(screen, height, messageX)
@@ -353,19 +372,21 @@ func (view *MessageView) Draw(screen mauview.Screen) {
 			}
 		}
 
-		if len(msg.FormatTime()) > 0 && !view.config.Preferences.HideTimestamp {
-			widget.WriteLineSimpleColor(screen, msg.FormatTime(), 0, line, msg.TimestampColor())
-		}
-		// TODO hiding senders might not be that nice after all, maybe an option? (disabled for now)
-		//if !bareMode && (prevMsg == nil || meta.Sender() != prevMsg.Sender()) {
-		widget.WriteLineColor(
-			screen, mauview.AlignRight, msg.GetSenderName(),
-			usernameX, line, view.SenderWidth,
-			msg.SenderColor())
-		//}
-		if msg.LastEditRef != nil {
-			// TODO add better indicator for edits
-			screen.SetCell(usernameX+view.SenderWidth, line, tcell.StyleDefault.Foreground(tcell.ColorDarkRed), '*')
+		if !bareMode {
+			if len(msg.FormatTime()) > 0 && !view.config.Preferences.HideTimestamp {
+				widget.WriteLineSimpleColor(screen, msg.FormatTime(), 0, line, msg.TimestampColor())
+			}
+			// TODO hiding senders might not be that nice after all, maybe an option? (disabled for now)
+			//if prevMsg == nil || meta.Sender() != prevMsg.Sender() {
+			widget.WriteLineColor(
+				screen, mauview.AlignRight, msg.GetSenderName(),
+				usernameX, line, view.SenderWidth,
+				msg.SenderColor())
+			//}
+			if msg.LastEditRef != nil {
+				// TODO add better indicator for edits
+				screen.SetCell(usernameX+view.SenderWidth, line, tcell.StyleDefault.Foreground(tcell.ColorDarkRed), '*')
+			}
 		}
 
 		msg.IsSelected = view.selected != 0 && msg.RowID == view.selected
@@ -391,13 +412,7 @@ func (view *MessageView) update(width int) {
 		lastRowIDInPrevTimeline = prevTimeline[len(prevTimeline)-1].RowID
 	}
 	increaseScrollOffset := false
-	bare := view.config.Preferences.BareMessageView
-	if !bare {
-		width -= view.SenderWidth + SenderMessageGap
-		if !view.config.Preferences.HideTimestamp {
-			width -= view.TimestampWidth + TimestampSenderGap
-		}
-	}
+	width = messageTextWidth(width, view.config.Preferences, view.SenderWidth, view.TimestampWidth)
 	scrollOffset := view.GetScrollOffset()
 	newScrollOffset := scrollOffset
 	appendBuffer := func(msg *messages.UIMessage) {

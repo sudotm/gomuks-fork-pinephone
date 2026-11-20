@@ -25,11 +25,13 @@ import (
 	"go.mau.fi/gomuks/pkg/rpc/store"
 	"go.mau.fi/gomuks/tui/config"
 	"go.mau.fi/gomuks/tui/messages/html"
+	"go.mau.fi/gomuks/tui/messages/tstring"
 )
 
 type HTMLMessage struct {
 	Root      html.Entity
 	TextColor tcell.Color
+	header    []tstring.TString
 }
 
 func NewHTMLMessage(room *store.RoomStore, evt *database.Event, content *event.MessageEventContent, root html.Entity) *UIMessage {
@@ -55,7 +57,20 @@ func (hw *HTMLMessage) Draw(screen mauview.Screen, msg *UIMessage) {
 		}, html.AdjustStyleReasonNormal)
 	}
 	screen.Clear()
-	hw.Root.Draw(screen, html.DrawContext{IsSelected: msg.IsSelected})
+	y := 0
+	for _, line := range hw.header {
+		line.Draw(screen, 0, y)
+		y++
+	}
+	body := mauview.Screen(screen)
+	if y > 0 {
+		w, h := screen.Size()
+		if h < y {
+			h = y
+		}
+		body = mauview.NewProxyScreen(screen, 0, y, w, h-y)
+	}
+	hw.Root.Draw(body, html.DrawContext{IsSelected: msg.IsSelected})
 }
 
 func (hw *HTMLMessage) OnKeyEvent(event mauview.KeyEvent) bool {
@@ -74,7 +89,9 @@ func (hw *HTMLMessage) CalculateBuffer(preferences config.UserPreferences, width
 	if width < 2 {
 		return
 	}
-	// TODO account for bare messages in initial startX
+	// HTML from Matrix is usually a block element, so the sender stays on a
+	// one-line header instead of a permanent column. The body then uses width.
+	hw.header = compactHeader(preferences, msg, width)
 	startX := 0
 	hw.TextColor = msg.TextColor()
 	hw.Root.CalculateBuffer(width, startX, html.DrawContext{
@@ -84,7 +101,7 @@ func (hw *HTMLMessage) CalculateBuffer(preferences config.UserPreferences, width
 }
 
 func (hw *HTMLMessage) Height() int {
-	return hw.Root.Height()
+	return len(hw.header) + hw.Root.Height()
 }
 
 func (hw *HTMLMessage) PlainText() string {

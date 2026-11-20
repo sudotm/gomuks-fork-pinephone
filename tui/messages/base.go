@@ -76,7 +76,14 @@ type UIMessage struct {
 	ReplyTo            *UIMessage
 	IsReplyBubble      bool
 	Renderer           MessageRenderer
-	bufferedWidth      int
+	bufferKey          bufferKey
+}
+
+type bufferKey struct {
+	width  int
+	prefs  int
+	sender string
+	edited bool
 }
 
 func (msg *UIMessage) GetEvent() *database.Event {
@@ -303,13 +310,24 @@ func (msg *UIMessage) calculateReplyBuffer(preferences config.UserPreferences, w
 }
 
 func (msg *UIMessage) CalculateBuffer(preferences config.UserPreferences, width int) {
-	// TODO check preferences (at least disable images and bare message view)
-	if msg.bufferedWidth == width {
+	sender := ""
+	edited := false
+	if msg.Event != nil {
+		sender = msg.GetSenderName()
+		edited = msg.LastEditRef != nil
+	}
+	key := bufferKey{
+		width:  width,
+		prefs:  LayoutPrefStamp(preferences),
+		sender: sender,
+		edited: edited,
+	}
+	if msg.bufferKey == key {
 		return
 	}
 	msg.Renderer.CalculateBuffer(preferences, width, msg)
 	msg.calculateReplyBuffer(preferences, width)
-	msg.bufferedWidth = width
+	msg.bufferKey = key
 }
 
 func (msg *UIMessage) DrawReply(screen mauview.Screen) mauview.Screen {

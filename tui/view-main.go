@@ -68,8 +68,8 @@ func (ui *GomuksTUI) NewMainView() mauview.Component {
 	//mainView.cmdProcessor = NewCommandProcessor(mainView)
 
 	mainView.flex.
-		AddFixedComponent(mainView.roomList, 25).
-		AddFixedComponent(widget.NewBorder(), 1).
+		AddFixedComponent(mainView.roomList, RoomListColumnWidth).
+		AddFixedComponent(widget.NewBorder(), RoomListBorderWidth).
 		AddProportionalComponent(mainView.roomView, 1)
 	mainView.BumpFocus(nil)
 
@@ -189,6 +189,18 @@ func (view *MainView) OnKeyEvent(event mauview.KeyEvent) bool {
 		view.SwitchRoom(view.roomList.NextWithActivity())
 	case "show_bare":
 		view.ShowBare(view.currentRoom)
+	case "toggle_room_list":
+		view.config.Preferences.HideRoomList = !view.config.Preferences.HideRoomList
+		view.applyLayoutPreference()
+	case "toggle_user_list":
+		view.config.Preferences.HideUserList = !view.config.Preferences.HideUserList
+		view.applyLayoutPreference()
+	case "toggle_timestamps":
+		view.config.Preferences.HideTimestamp = !view.config.Preferences.HideTimestamp
+		view.applyLayoutPreference()
+	case "toggle_compact_messages":
+		view.config.Preferences.BareMessageView = !view.config.Preferences.BareMessageView
+		view.applyLayoutPreference()
 	case "force_quit":
 		view.parent.Finish()
 		return false
@@ -224,6 +236,23 @@ func (view *MainView) OnPasteEvent(event mauview.PasteEvent) bool {
 		return view.roomView.OnPasteEvent(event)
 	}
 	return view.flex.OnPasteEvent(event)
+}
+
+// applyLayoutPreference redraws after a layout toggle.
+// It does not move focus, recreate the room view, or touch composer text.
+func (view *MainView) applyLayoutPreference() {
+	if room := view.currentRoom; room != nil && room.Room != nil {
+		if meta := room.Room.Meta.Current(); meta != nil {
+			room.Update(meta)
+		}
+	}
+	if err := view.config.SavePreferences(); err != nil {
+		debug.Print("Failed to save layout preferences:", err)
+		if view.currentRoom != nil {
+			view.currentRoom.AddServiceMessage("Failed to save layout settings: %v", err)
+		}
+	}
+	view.parent.Render()
 }
 
 func (view *MainView) Focus() {

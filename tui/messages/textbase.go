@@ -17,8 +17,9 @@
 package messages
 
 import (
-	"fmt"
 	"regexp"
+
+	"github.com/gdamore/tcell/v2"
 
 	"go.mau.fi/gomuks/tui/config"
 	"go.mau.fi/gomuks/tui/messages/tstring"
@@ -52,6 +53,82 @@ func matchBoundaryPattern(bare bool, extract tstring.TString) tstring.TString {
 // CalculateBuffer generates the internal buffer for this message that consists
 // of the text of this message split into lines at most as wide as the width
 // parameter.
+func LayoutPrefStamp(p config.UserPreferences) int {
+	stamp := 0
+	if p.BareMessageView {
+		stamp |= 1
+	}
+	if p.HideTimestamp {
+		stamp |= 2
+	}
+	if p.DisableImages {
+		stamp |= 4
+	}
+	if p.EnableInlineURLs() {
+		stamp |= 8
+	}
+	return stamp
+}
+
+func appendRunes(dst tstring.TString, s string, color tcell.Color) tstring.TString {
+	for _, r := range s {
+		if color == tcell.ColorDefault {
+			dst = append(dst, tstring.NewCell(r))
+		} else {
+			dst = append(dst, tstring.NewColorCell(r, color))
+		}
+	}
+	return dst
+}
+
+// compactPrefix is the author (and optional timestamp) used when the sender
+// column is hidden. Service lines keep a timestamp but not the "*" placeholder.
+func compactPrefix(prefs config.UserPreferences, msg *UIMessage) tstring.TString {
+	if msg == nil || msg.Event == nil {
+		return nil
+	}
+	var prefix tstring.TString
+	if !prefs.HideTimestamp {
+		if ts := msg.FormatTime(); ts != "" {
+			prefix = appendRunes(prefix, ts, msg.TimestampColor())
+		}
+	}
+	if msg.IsService {
+		return prefix
+	}
+	name := msg.GetSenderName()
+	if name == "" {
+		return prefix
+	}
+	if len(prefix) > 0 {
+		prefix = appendRunes(prefix, " ", tcell.ColorDefault)
+	}
+	prefix = appendRunes(prefix, "<"+name+">", msg.SenderColor())
+	if msg.LastEditRef != nil {
+		prefix = appendRunes(prefix, "*", tcell.ColorDarkRed)
+	}
+	return prefix
+}
+
+// compactHeader is a single line naming the author. It is truncated to width
+// so a long display name cannot push the message body into another column.
+func compactHeader(prefs config.UserPreferences, msg *UIMessage, width int) []tstring.TString {
+	if !prefs.BareMessageView || width < 2 {
+		return nil
+	}
+	prefix := compactPrefix(prefs, msg)
+	if len(prefix) == 0 {
+		return nil
+	}
+	if prefix.RuneWidth() > width {
+		prefix = prefix.Truncate(width)
+	}
+	if len(prefix) == 0 {
+		return nil
+	}
+	return []tstring.TString{prefix}
+}
+
 func calculateBufferWithText(prefs config.UserPreferences, text tstring.TString, width int, msg *UIMessage) []tstring.TString {
 	if width < 2 {
 		return nil
@@ -60,14 +137,13 @@ func calculateBufferWithText(prefs config.UserPreferences, text tstring.TString,
 	var buffer []tstring.TString
 
 	if prefs.BareMessageView {
-		newText := tstring.NewTString(msg.FormatTime())
-		if len(msg.GetSenderName()) > 0 {
-			newText = newText.AppendTString(tstring.NewColorTString(fmt.Sprintf(" <%s> ", msg.GetSenderName()), msg.SenderColor()))
-		} else {
-			newText = newText.Append(" ")
+		if prefix := compactPrefix(prefs, msg); len(prefix) > 0 {
+			if len(text) > 0 {
+				text = prefix.Append(" ").AppendTString(text)
+			} else {
+				text = prefix
+			}
 		}
-		newText = newText.AppendTString(text)
-		text = newText
 	}
 
 	forcedLinebreaks := text.Split('\n')
@@ -84,9 +160,17 @@ func calculateBufferWithText(prefs config.UserPreferences, text tstring.TString,
 			extract := str.Truncate(width)
 			if len(extract) < len(str) {
 				if spaces := spacePattern.FindStringIndex(str[len(extract):].String()); spaces != nil && spaces[0] == 0 {
-					extract = str[:len(extract)+spaces[1]]
+					// Keep the break space on this line only when it still fits.
+					// Absorbing it unconditionally made the line wider than width.
+					candidate := str[:len(extract)+spaces[1]]
+					if candidate.RuneWidth() <= width {
+						extract = candidate
+					}
 				}
 				extract = matchBoundaryPattern(prefs.BareMessageView, extract)
+			}
+			if len(extract) == 0 {
+				extract = str[:1]
 			}
 			buffer = append(buffer, extract)
 			str = str[len(extract):]

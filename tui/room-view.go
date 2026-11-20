@@ -277,6 +277,9 @@ const (
 	UserListWidth         = 20
 	StaticHorizontalSpace = UserListBorderWidth + UserListWidth
 
+	RoomListColumnWidth = 25
+	RoomListBorderWidth = 1
+
 	TopicBarHeight  = 1
 	StatusBarHeight = 1
 
@@ -307,10 +310,7 @@ func (view *RoomView) Draw(screen mauview.Screen) {
 		inputHeight = 1
 	}
 	contentHeight := height - inputHeight - TopicBarHeight - StatusBarHeight
-	contentWidth := width - StaticHorizontalSpace
-	if view.config.Preferences.HideUserList {
-		contentWidth = width
-	}
+	contentWidth := roomContentWidth(width, view.config.Preferences.HideUserList)
 
 	view.topicScreen.Width = width
 	view.contentScreen.Width = contentWidth
@@ -386,6 +386,16 @@ func (view *RoomView) OnKeyEvent(event mauview.KeyEvent) bool {
 		return true
 	}
 	return view.input.OnKeyEvent(event)
+}
+
+func roomContentWidth(roomWidth int, hideUserList bool) int {
+	if hideUserList {
+		return roomWidth
+	}
+	if roomWidth < StaticHorizontalSpace {
+		return 0
+	}
+	return roomWidth - StaticHorizontalSpace
 }
 
 func (view *RoomView) OnPasteEvent(event mauview.PasteEvent) bool {

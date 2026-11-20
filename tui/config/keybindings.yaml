@@ -14,6 +14,11 @@ main:
     'Alt+Enter': add_newline
     'Alt+a': next_active_room
     'Alt+l': show_bare
+    # Layout toggles. Ctrl+l and Alt+l stay bound to the temporary plaintext view.
+    'Alt+1': toggle_room_list
+    'Alt+2': toggle_user_list
+    'Alt+3': toggle_timestamps
+    'Alt+4': toggle_compact_messages
     'Ctrl+c': force_quit
 
 modal:
